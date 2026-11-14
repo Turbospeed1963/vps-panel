@@ -39,7 +39,7 @@ header() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "╔══════════════════════════════════════════╗"
-  echo "║              VPS  PANEL  v1.1            ║"
+  echo "║              VPS  PANEL  v1.2            ║"
   echo "╚══════════════════════════════════════════╝"
   echo -e "${NC}"
   local ip
@@ -300,7 +300,24 @@ do_reboot() {
 }
 
 # ---------- 13. Cloudflare Tunnel ----------
+CF_DIR=/etc/cloudflared-panel
+CF_TOKEN_FILE=$CF_DIR/token
+CF_LOG=/var/log/cloudflared-panel.log
+
+# systemd is missing in most containers (Railway, Docker, etc.)
+have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; }
 cf_installed() { command -v cloudflared >/dev/null 2>&1; }
+cf_running() { pgrep -x cloudflared >/dev/null 2>&1; }
+
+cf_state() {
+  if have_systemd; then
+    systemctl is-active cloudflared 2>/dev/null || true
+  elif cf_running; then
+    echo active
+  else
+    echo inactive
+  fi
+}
 
 cf_install() {
   if cf_installed; then
@@ -317,6 +334,23 @@ cf_install() {
     > /etc/apt/sources.list.d/cloudflared.list
   apt-get update -y && apt-get install -y cloudflared
   if cf_installed; then ok "cloudflared installed"; else err "Install failed"; return 1; fi
+}
+
+# Run cloudflared as a background process (no systemd). Token is passed via
+# environment variable so it does not show up in the process list.
+cf_start_bg() {
+  if [[ ! -s $CF_TOKEN_FILE ]]; then err "No saved token. Use option 1 first."; return 1; fi
+  command -v pgrep >/dev/null || { apt-get update -y >/dev/null 2>&1; apt-get install -y procps; }
+  pkill -x cloudflared 2>/dev/null; sleep 1
+  : > "$CF_LOG"
+  TUNNEL_TOKEN=$(cat "$CF_TOKEN_FILE") nohup cloudflared tunnel --no-autoupdate run >> "$CF_LOG" 2>&1 &
+  disown 2>/dev/null
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    if cf_running && grep -q "Registered tunnel connection" "$CF_LOG" 2>/dev/null; then return 0; fi
+  done
+  return 1
 }
 
 cf_connect() {
@@ -336,25 +370,56 @@ cf_connect() {
     return 1
   fi
 
-  # If a service already exists, remove it first
-  if systemctl list-unit-files 2>/dev/null | grep -q '^cloudflared.service'; then
-    warn "Tunnel service already exists, replacing it..."
-    cloudflared service uninstall >/dev/null 2>&1
-  fi
+  if have_systemd; then
+    # If a service already exists, remove it first
+    if systemctl list-unit-files 2>/dev/null | grep -q '^cloudflared.service'; then
+      warn "Tunnel service already exists, replacing it..."
+      cloudflared service uninstall >/dev/null 2>&1
+    fi
 
-  if cloudflared service install "$token"; then
-    systemctl enable --now cloudflared >/dev/null 2>&1
-    sleep 3
-    if systemctl is-active --quiet cloudflared; then
-      ok "Tunnel connected"
-      echo "Set the Hostname/Service (e.g. http://localhost:80) in the Cloudflare Dashboard."
+    if cloudflared service install "$token"; then
+      systemctl enable --now cloudflared >/dev/null 2>&1
+      sleep 3
+      if systemctl is-active --quiet cloudflared; then
+        ok "Tunnel connected"
+        echo "Set the Hostname/Service (e.g. http://localhost:80) in the Cloudflare Dashboard."
+      else
+        err "Service is not running. Check logs (option 4)"
+      fi
     else
-      err "Service is not running. Check logs (option 4)"
+      err "Tunnel service install failed"
     fi
   else
-    err "Tunnel service install failed"
+    warn "systemd not available (container). Running cloudflared as a background process."
+    # Remove a leftover SysV service from an earlier failed install
+    if [[ -e /etc/init.d/cloudflared ]]; then
+      cloudflared service uninstall >/dev/null 2>&1
+      rm -f /etc/init.d/cloudflared
+    fi
+    mkdir -p "$CF_DIR"; chmod 700 "$CF_DIR"
+    ( umask 077; printf '%s' "$token" > "$CF_TOKEN_FILE" )
+    echo "Connecting..."
+    if cf_start_bg; then
+      ok "Tunnel connected (background process)"
+      echo "Set the Hostname/Service (e.g. http://localhost:8080) in the Cloudflare Dashboard."
+      warn "In a container the tunnel stops when the container restarts. Re-run option 1 or 3 then."
+    else
+      err "Tunnel did not connect. Last log lines:"
+      tail -n 12 "$CF_LOG" 2>/dev/null
+    fi
   fi
   unset raw token
+}
+
+cf_status() {
+  if have_systemd; then
+    systemctl status cloudflared --no-pager 2>&1 | head -n 20
+  else
+    echo "State : $(cf_state)"
+    cf_running && echo "PID   : $(pgrep -x cloudflared | head -n1)"
+    echo "--- last log lines ---"
+    tail -n 8 "$CF_LOG" 2>/dev/null || echo "(no log yet)"
+  fi
 }
 
 cf_menu() {
@@ -363,9 +428,10 @@ cf_menu() {
     echo -e "${BOLD}== Cloudflare Tunnel ==${NC}"
     if cf_installed; then
       local st
-      st=$(systemctl is-active cloudflared 2>/dev/null)
-      [[ $st == active ]] && st="${GREEN}running${NC}" || st="${RED}${st:-not installed}${NC}"
-      echo -e " Status: $st   ($(cloudflared --version 2>&1 | head -n1))"
+      st=$(cf_state)
+      if [[ $st == active ]]; then st="${GREEN}running${NC}"; else st="${RED}${st:-stopped}${NC}"; fi
+      echo -e " Status: $st   ($(cloudflared --version 2>&1 | head -n1 | cut -c1-40))"
+      have_systemd || echo -e " Mode  : ${YELLOW}background process (no systemd)${NC}"
     else
       echo -e " Status: ${YELLOW}cloudflared not installed${NC}"
     fi
@@ -374,24 +440,36 @@ cf_menu() {
     echo " 2) Show status"
     echo " 3) Restart"
     echo " 4) Show logs (last 50 lines)"
-    echo " 5) Remove tunnel (service uninstall)"
+    echo " 5) Remove tunnel"
     echo " 6) Update cloudflared"
     echo " 0) Back"
     read -rp "Choose: " c
     case $c in
       1) cf_connect; pause ;;
-      2) systemctl status cloudflared --no-pager 2>&1 | head -n 20; pause ;;
-      3) systemctl restart cloudflared && ok "Restarted"; pause ;;
-      4) journalctl -u cloudflared -n 50 --no-pager; pause ;;
+      2) cf_status; pause ;;
+      3)
+        if have_systemd; then
+          systemctl restart cloudflared && ok "Restarted"
+        else
+          echo "Restarting..."
+          if cf_start_bg; then ok "Restarted, tunnel connected"; else err "Did not connect"; tail -n 8 "$CF_LOG" 2>/dev/null; fi
+        fi
+        pause ;;
+      4)
+        if have_systemd; then journalctl -u cloudflared -n 50 --no-pager; else tail -n 50 "$CF_LOG" 2>/dev/null || echo "(no log yet)"; fi
+        pause ;;
       5)
         read -rp "Remove tunnel? (yes/no): " a
         if [[ $a == yes ]]; then
-          cloudflared service uninstall && ok "Tunnel service removed"
+          pkill -x cloudflared 2>/dev/null
+          cloudflared service uninstall >/dev/null 2>&1
+          rm -rf "$CF_DIR" "$CF_LOG"
+          ok "Tunnel removed"
         fi
         pause ;;
       6)
         apt-get update -y && apt-get install -y --only-upgrade cloudflared
-        ok "Updated"; pause ;;
+        ok "Updated (restart the tunnel to use the new version)"; pause ;;
       0) return ;;
       *) err "Invalid choice"; sleep 1 ;;
     esac
@@ -404,7 +482,55 @@ WP_APP=$WP_DIR/app.py
 WP_CONF=/etc/vps-webpanel/config.json
 WP_SVC=vps-webpanel
 
+WP_LOG=/var/log/vps-webpanel.log
+
 wp_installed() { [[ -f $WP_APP ]]; }
+
+wp_state() {
+  if have_systemd; then
+    systemctl is-active "$WP_SVC" 2>/dev/null || true
+  elif pgrep -f "python3 $WP_APP" >/dev/null 2>&1; then
+    echo active
+  else
+    echo inactive
+  fi
+}
+
+wp_stop() {
+  if have_systemd; then
+    systemctl stop "$WP_SVC" 2>/dev/null
+  else
+    pkill -f "python3 $WP_APP" 2>/dev/null; sleep 1
+  fi
+}
+
+wp_start() {
+  if have_systemd; then
+    systemctl enable --now "$WP_SVC" >/dev/null 2>&1
+  else
+    nohup python3 "$WP_APP" >> "$WP_LOG" 2>&1 &
+    disown 2>/dev/null
+  fi
+}
+
+wp_restart() { wp_stop; wp_start; sleep 1; }
+
+wp_status() {
+  if have_systemd; then
+    systemctl status "$WP_SVC" --no-pager 2>&1 | head -n 15
+  else
+    echo "State: $(wp_state)  (background process, no systemd)"
+    tail -n 8 "$WP_LOG" 2>/dev/null
+  fi
+}
+
+wp_logs() {
+  if have_systemd; then
+    journalctl -u "$WP_SVC" -n 50 --no-pager
+  else
+    tail -n 50 "$WP_LOG" 2>/dev/null || echo "(no log yet)"
+  fi
+}
 
 wp_port() {
   python3 -c 'import json,sys
@@ -528,9 +654,23 @@ def run(cmd, timeout=30, env=None, stdout_only=False):
         return "Error: %s" % e
 
 
+PROCS = {"cloudflared": "cloudflared", "nginx": "nginx", "docker": "dockerd",
+         "ssh": "sshd", "fail2ban": "fail2ban-server"}
+HAS_SYSTEMD = os.path.isdir("/run/systemd/system")
+
+
 def svc_state(name):
-    out = run(["systemctl", "is-active", name], 5)
-    return out.splitlines()[0] if out else "unknown"
+    if HAS_SYSTEMD:
+        out = run(["systemctl", "is-active", name], 5)
+        return out.splitlines()[0] if out else "unknown"
+    proc = PROCS.get(name)  # container without systemd: check the process instead
+    if not proc:
+        return "unknown"
+    try:
+        r = subprocess.run(["pgrep", "-x", proc], capture_output=True, timeout=5)
+        return "active" if r.returncode == 0 else "inactive"
+    except Exception:
+        return "unknown"
 
 
 def human(n):
@@ -756,7 +896,8 @@ class H(BaseHTTPRequestHandler):
         act = d.get("act", "")
         if act.startswith("restart:") and act[8:] in RESTARTABLE:
             name = act[8:]
-            out = run(["systemctl", "restart", name], 60) or "Restart command sent."
+            cmd = ["systemctl", "restart", name] if HAS_SYSTEMD else ["service", name, "restart"]
+            out = run(cmd, 60) or "Restart command sent."
             out += "\nStatus: " + svc_state(name)
         elif act == "check_updates":
             env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
@@ -816,7 +957,8 @@ wp_install() {
   command -v python3 >/dev/null || apt-get install -y python3
   command -v curl >/dev/null || apt-get install -y curl
 
-  systemctl stop "$WP_SVC" 2>/dev/null
+  command -v pgrep >/dev/null || { apt-get update -y >/dev/null 2>&1; apt-get install -y procps; }
+  wp_stop
   wp_write_app
 
   local port
@@ -827,6 +969,7 @@ wp_install() {
 
   wp_set_password || { pause; return; }
 
+  if have_systemd; then
   cat > /etc/systemd/system/${WP_SVC}.service <<EOF
 [Unit]
 Description=VPS Web Panel
@@ -843,7 +986,8 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now "$WP_SVC" >/dev/null 2>&1
+  fi
+  wp_start
   sleep 2
 
   local code
@@ -851,7 +995,7 @@ EOF
   if [[ $code == 200 ]]; then
     ok "Web panel is running (http://127.0.0.1:${port})"
   else
-    err "Panel failed to start (HTTP $code). Logs: journalctl -u $WP_SVC -n 30"
+    err "Panel failed to start (HTTP $code). See logs (menu 14 > 5)"
     pause; return
   fi
   wp_tunnel_help "$port"
@@ -873,7 +1017,7 @@ wp_tunnel_help() {
   echo -e "${YELLOW}Security tip:${NC} In Zero Trust > Access > Applications,"
   echo "add an Access policy (email OTP / Google login) for this hostname."
   echo "Cloudflare will then verify visitors before they reach the panel login."
-  if ! systemctl is-active --quiet cloudflared 2>/dev/null; then
+  if [[ $(cf_state) != active ]]; then
     echo
     warn "cloudflared is not running. Connect your Tunnel token first via menu 13."
   fi
@@ -885,7 +1029,7 @@ wp_menu() {
     echo -e "${BOLD}== Web Panel ==${NC}"
     if wp_installed; then
       local st
-      st=$(systemctl is-active "$WP_SVC" 2>/dev/null)
+      st=$(wp_state)
       [[ $st == active ]] && st="${GREEN}running${NC}" || st="${RED}${st:-stopped}${NC}"
       echo -e " Status: $st   Local: http://127.0.0.1:$(wp_port)"
     else
@@ -904,19 +1048,22 @@ wp_menu() {
     read -rp "Choose: " c
     case $c in
       1) wp_install ;;
-      2) systemctl status "$WP_SVC" --no-pager 2>&1 | head -n 15; pause ;;
-      3) if wp_installed; then wp_set_password && systemctl restart "$WP_SVC" && ok "All sessions have been logged out"; else err "Install the panel first"; fi; pause ;;
-      4) systemctl restart "$WP_SVC" && ok "Restarted"; pause ;;
-      5) journalctl -u "$WP_SVC" -n 50 --no-pager; pause ;;
+      2) wp_status; pause ;;
+      3) if wp_installed; then wp_set_password && wp_restart && ok "All sessions have been logged out"; else err "Install the panel first"; fi; pause ;;
+      4) wp_restart; ok "Restarted"; pause ;;
+      5) wp_logs; pause ;;
       6) wp_tunnel_help; pause ;;
-      7) if wp_installed; then wp_write_app && systemctl restart "$WP_SVC" && ok "Updated"; else err "Install the panel first"; fi; pause ;;
+      7) if wp_installed; then wp_write_app && wp_restart && ok "Updated"; else err "Install the panel first"; fi; pause ;;
       8)
         read -rp "Remove web panel? (yes/no): " a
         if [[ $a == yes ]]; then
-          systemctl disable --now "$WP_SVC" 2>/dev/null
-          rm -f /etc/systemd/system/${WP_SVC}.service
-          rm -rf "$WP_DIR" /etc/vps-webpanel
-          systemctl daemon-reload
+          wp_stop
+          if have_systemd; then
+            systemctl disable "$WP_SVC" 2>/dev/null
+            rm -f /etc/systemd/system/${WP_SVC}.service
+            systemctl daemon-reload
+          fi
+          rm -rf "$WP_DIR" /etc/vps-webpanel "$WP_LOG"
           ok "Removed. Also delete the hostname in the Cloudflare Dashboard."
         fi
         pause ;;
