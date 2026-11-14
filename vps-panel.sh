@@ -39,7 +39,7 @@ header() {
   clear
   echo -e "${CYAN}${BOLD}"
   echo "╔══════════════════════════════════════════╗"
-  echo "║              VPS  PANEL  v1.2            ║"
+  echo "║              VPS  PANEL  v1.4            ║"
   echo "╚══════════════════════════════════════════╝"
   echo -e "${NC}"
   local ip
@@ -273,7 +273,8 @@ monitor_menu() {
   header
   echo -e "${BOLD}== Monitor ==${NC}"
   echo "-- Listening ports --"
-  ss -tulpn | head -n 25
+  command -v ss >/dev/null || { apt-get update -y >/dev/null 2>&1; apt-get install -y iproute2 >/dev/null 2>&1; }
+  ss -tulpn 2>/dev/null | head -n 25 || echo "(ss not available)"
   echo
   echo "-- Top 5 CPU --"
   ps aux --sort=-%cpu | head -n 6
@@ -303,6 +304,18 @@ do_reboot() {
 CF_DIR=/etc/cloudflared-panel
 CF_TOKEN_FILE=$CF_DIR/token
 CF_LOG=/var/log/cloudflared-panel.log
+
+# Run a command fully detached from this terminal: new session (setsid), ignores
+# hangup (nohup), no tty on stdin, and re-parented to init via the subshell.
+# It keeps running after you close the terminal. Env vars set before the call are inherited.
+detach_run() {
+  local log=$1; shift
+  if command -v setsid >/dev/null 2>&1; then
+    ( setsid nohup "$@" >> "$log" 2>&1 < /dev/null & )
+  else
+    ( nohup "$@" >> "$log" 2>&1 < /dev/null & )
+  fi
+}
 
 # systemd is missing in most containers (Railway, Docker, etc.)
 have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; }
@@ -343,8 +356,7 @@ cf_start_bg() {
   command -v pgrep >/dev/null || { apt-get update -y >/dev/null 2>&1; apt-get install -y procps; }
   pkill -x cloudflared 2>/dev/null; sleep 1
   : > "$CF_LOG"
-  TUNNEL_TOKEN=$(cat "$CF_TOKEN_FILE") nohup cloudflared tunnel --no-autoupdate run >> "$CF_LOG" 2>&1 &
-  disown 2>/dev/null
+  TUNNEL_TOKEN=$(cat "$CF_TOKEN_FILE") detach_run "$CF_LOG" cloudflared tunnel --no-autoupdate run
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
@@ -401,7 +413,8 @@ cf_connect() {
     echo "Connecting..."
     if cf_start_bg; then
       ok "Tunnel connected (background process)"
-      echo "Set the Hostname/Service (e.g. http://localhost:8080) in the Cloudflare Dashboard."
+      echo "It keeps running after you close this terminal."
+      echo "Set the Hostname/Service in the Cloudflare Dashboard (web panel: menu 14 shows the port)."
       warn "In a container the tunnel stops when the container restarts. Re-run option 1 or 3 then."
     else
       err "Tunnel did not connect. Last log lines:"
@@ -486,6 +499,20 @@ WP_LOG=/var/log/vps-webpanel.log
 
 wp_installed() { [[ -f $WP_APP ]]; }
 
+# True if something already listens on 127.0.0.1:$1 (works without ss/netstat)
+port_in_use() {
+  timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/"$1"' _ "$1" 2>/dev/null
+}
+
+# First free port starting at 8787 (8080 is often taken by other services)
+wp_pick_port() {
+  local p
+  for p in $(seq 8787 8830); do
+    port_in_use "$p" || { echo "$p"; return; }
+  done
+  echo 8787
+}
+
 wp_state() {
   if have_systemd; then
     systemctl is-active "$WP_SVC" 2>/dev/null || true
@@ -508,8 +535,7 @@ wp_start() {
   if have_systemd; then
     systemctl enable --now "$WP_SVC" >/dev/null 2>&1
   else
-    nohup python3 "$WP_APP" >> "$WP_LOG" 2>&1 &
-    disown 2>/dev/null
+    detach_run "$WP_LOG" python3 "$WP_APP"
   fi
 }
 
@@ -961,10 +987,11 @@ wp_install() {
   wp_stop
   wp_write_app
 
-  local port
-  read -rp "Panel port (listens on localhost only) [8080]: " port; port=${port:-8080}
+  local port def
+  def=$(wp_pick_port)
+  read -rp "Panel port (listens on localhost only) [$def]: " port; port=${port:-$def}
   if [[ ! $port =~ ^[0-9]+$ ]] || (( port<1024 || port>65535 )); then err "Invalid port"; pause; return; fi
-  if ss -ltn | awk '{print $4}' | grep -qE "[:.]${port}$"; then err "Port $port is already in use"; pause; return; fi
+  if port_in_use "$port"; then err "Port $port is already used by another program. Choose a different port."; pause; return; fi
   python3 "$WP_APP" --set-port "$port" || { pause; return; }
 
   wp_set_password || { pause; return; }
@@ -990,12 +1017,14 @@ EOF
   wp_start
   sleep 2
 
-  local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/login")
-  if [[ $code == 200 ]]; then
+  local html
+  html=$(curl -s --max-time 5 "http://127.0.0.1:${port}/login")
+  if [[ $html == *"VPS Panel"* ]]; then
     ok "Web panel is running (http://127.0.0.1:${port})"
+    have_systemd || echo "It keeps running after you close this terminal."
   else
-    err "Panel failed to start (HTTP $code). See logs (menu 14 > 5)"
+    err "Panel failed to start. Last log lines:"
+    wp_logs 2>&1 | tail -n 8
     pause; return
   fi
   wp_tunnel_help "$port"
