@@ -17,19 +17,19 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ---------- Root check ----------
 if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}Root အဖြစ် run ပါ: sudo bash $0${NC}"
+  echo -e "${RED}Please run as root: sudo bash $0${NC}"
   exit 1
 fi
 
 # ---------- OS check ----------
 if ! command -v apt-get >/dev/null 2>&1; then
-  echo -e "${RED}Ubuntu/Debian သာ support လုပ်ပါတယ်။${NC}"
+  echo -e "${RED}Only Ubuntu/Debian is supported.${NC}"
   exit 1
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-pause() { echo; read -rp "Enter နှိပ်ပါ... " _; }
+pause() { echo; read -rp "Press Enter to continue... " _; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 err()   { echo -e "${RED}[ERR]${NC} $*"; }
@@ -68,8 +68,8 @@ sys_update() {
   header
   echo -e "${BOLD}== System Update ==${NC}"
   apt-get update -y && apt-get upgrade -y && apt-get autoremove -y
-  ok "Update ပြီးပါပြီ"
-  [[ -f /var/run/reboot-required ]] && warn "Reboot လိုအပ်ပါတယ်။"
+  ok "Update complete"
+  [[ -f /var/run/reboot-required ]] && warn "Reboot required."
   pause
 }
 
@@ -78,7 +78,7 @@ install_tools() {
   header
   echo -e "${BOLD}== Basic Tools Install ==${NC}"
   apt-get install -y curl wget git nano htop unzip zip ufw fail2ban net-tools
-  ok "Tools install ပြီးပါပြီ"
+  ok "Tools installed"
   pause
 }
 
@@ -87,13 +87,13 @@ firewall_menu() {
   while true; do
     header
     echo -e "${BOLD}== Firewall (UFW) ==${NC}"
-    echo " 1) Firewall ဖွင့်မယ် (SSH ကို အရင် allow လုပ်ပြီး)"
-    echo " 2) Port ဖွင့်မယ်"
-    echo " 3) Port ပိတ်မယ် (rule ဖျက်)"
-    echo " 4) Status ကြည့်မယ်"
-    echo " 5) Firewall ပိတ်မယ်"
-    echo " 0) နောက်သို့"
-    read -rp "ရွေးပါ: " c
+    echo " 1) Enable firewall (allows SSH first)"
+    echo " 2) Open a port"
+    echo " 3) Close a port (delete rule)"
+    echo " 4) Show status"
+    echo " 5) Disable firewall"
+    echo " 0) Back"
+    read -rp "Choose: " c
     case $c in
       1)
         command -v ufw >/dev/null || apt-get install -y ufw
@@ -106,24 +106,24 @@ firewall_menu() {
         ufw allow 80/tcp
         ufw allow 443/tcp
         ufw --force enable
-        ok "UFW ဖွင့်ပြီး (SSH:${sshp}, 80, 443 allow)"
+        ok "UFW enabled (SSH:${sshp}, 80, 443 allowed)"
         pause ;;
       2)
-        read -rp "Port နံပါတ်: " p
+        read -rp "Port number: " p
         read -rp "Protocol (tcp/udp) [tcp]: " pr; pr=${pr:-tcp}
         if [[ $p =~ ^[0-9]+$ ]] && (( p>=1 && p<=65535 )); then
-          ufw allow "${p}/${pr}" && ok "Port $p/$pr ဖွင့်ပြီး"
-        else err "Port မှားနေပါတယ်"; fi
+          ufw allow "${p}/${pr}" && ok "Port $p/$pr opened"
+        else err "Invalid port"; fi
         pause ;;
       3)
-        read -rp "Port နံပါတ်: " p
+        read -rp "Port number: " p
         read -rp "Protocol (tcp/udp) [tcp]: " pr; pr=${pr:-tcp}
-        ufw delete allow "${p}/${pr}" && ok "Rule ဖျက်ပြီး"
+        ufw delete allow "${p}/${pr}" && ok "Rule deleted"
         pause ;;
       4) ufw status verbose; pause ;;
-      5) ufw disable && warn "Firewall ပိတ်ထားပါတယ်"; pause ;;
+      5) ufw disable && warn "Firewall disabled"; pause ;;
       0) return ;;
-      *) err "မှားနေပါတယ်" ; sleep 1 ;;
+      *) err "Invalid choice" ; sleep 1 ;;
     esac
   done
 }
@@ -133,57 +133,57 @@ ssh_menu() {
   while true; do
     header
     echo -e "${BOLD}== SSH Security ==${NC}"
-    echo " 1) SSH Port ပြောင်းမယ်"
-    echo " 2) Root password login ပိတ်မယ် (key ရှိမှသာ!)"
-    echo " 3) Sudo user အသစ်ဖန်တီးမယ်"
-    echo " 4) Fail2ban ဖွင့်မယ်"
-    echo " 0) နောက်သို့"
-    read -rp "ရွေးပါ: " c
+    echo " 1) Change SSH port"
+    echo " 2) Disable root password login (only if you have an SSH key!)"
+    echo " 3) Create a new sudo user"
+    echo " 4) Enable Fail2ban"
+    echo " 0) Back"
+    read -rp "Choose: " c
     case $c in
       1)
-        read -rp "Port အသစ် (1024-65535): " np
+        read -rp "New port (1024-65535): " np
         if [[ $np =~ ^[0-9]+$ ]] && (( np>=1024 && np<=65535 )); then
           cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
           sed -i -E "s/^#?\s*Port .*/Port ${np}/" /etc/ssh/sshd_config
           command -v ufw >/dev/null && ufw allow "${np}/tcp"
           if sshd -t; then
             systemctl restart ssh 2>/dev/null || systemctl restart sshd
-            ok "SSH Port => ${np} (session မပိတ်ခင် port အသစ်နဲ့ စမ်းချိတ်ကြည့်ပါ!)"
+            ok "SSH port => ${np} (test a new login on this port before closing this session!)"
           else
             cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
-            err "Config မှားလို့ ပြန်ထားလိုက်ပါတယ်"
+            err "Config invalid, previous config restored"
           fi
-        else err "Port မှားနေပါတယ်"; fi
+        else err "Invalid port"; fi
         pause ;;
       2)
-        warn "SSH key မထည့်ရသေးရင် ဒါကိုမလုပ်ပါနဲ့၊ server ထဲ ပြန်မဝင်နိုင်တော့ပါ။"
-        read -rp "ဆက်လုပ်မလား? (yes/no): " a
+        warn "Do NOT do this unless an SSH key is installed, or you will be locked out."
+        read -rp "Continue? (yes/no): " a
         if [[ $a == yes ]]; then
           cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
           sed -i -E "s/^#?\s*PermitRootLogin .*/PermitRootLogin prohibit-password/" /etc/ssh/sshd_config
           sed -i -E "s/^#?\s*PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
           if sshd -t; then
             systemctl restart ssh 2>/dev/null || systemctl restart sshd
-            ok "Password login ပိတ်ပြီး"
+            ok "Password login disabled"
           else
             cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
-            err "Config မှားလို့ ပြန်ထားလိုက်ပါတယ်"
+            err "Config invalid, previous config restored"
           fi
         fi
         pause ;;
       3)
         read -rp "Username: " u
         if [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-          adduser --gecos "" "$u" && usermod -aG sudo "$u" && ok "User '$u' ဖန်တီးပြီး (sudo ပါ)"
-        else err "Username မှားနေပါတယ်"; fi
+          adduser --gecos "" "$u" && usermod -aG sudo "$u" && ok "User '$u' created (with sudo)"
+        else err "Invalid username"; fi
         pause ;;
       4)
         apt-get install -y fail2ban
         systemctl enable --now fail2ban
-        ok "Fail2ban ဖွင့်ပြီး"
+        ok "Fail2ban enabled"
         pause ;;
       0) return ;;
-      *) err "မှားနေပါတယ်"; sleep 1 ;;
+      *) err "Invalid choice"; sleep 1 ;;
     esac
   done
 }
@@ -194,29 +194,29 @@ web_menu() {
     header
     echo -e "${BOLD}== Web Server ==${NC}"
     echo " 1) Nginx install"
-    echo " 2) SSL (Let's Encrypt) ထည့်မယ်"
+    echo " 2) Add SSL (Let's Encrypt)"
     echo " 3) Nginx restart"
     echo " 4) Nginx config test"
-    echo " 0) နောက်သို့"
-    read -rp "ရွေးပါ: " c
+    echo " 0) Back"
+    read -rp "Choose: " c
     case $c in
       1)
         apt-get install -y nginx
         systemctl enable --now nginx
-        ok "Nginx install ပြီး"
+        ok "Nginx installed"
         pause ;;
       2)
-        read -rp "Domain (ဥပမာ example.com): " d
+        read -rp "Domain (e.g. example.com): " d
         read -rp "Email: " e
         if [[ -n $d && -n $e ]]; then
           apt-get install -y certbot python3-certbot-nginx
           certbot --nginx -d "$d" -m "$e" --agree-tos --no-eff-email --redirect
-        else err "Domain/Email လိုအပ်ပါတယ်"; fi
+        else err "Domain and email are required"; fi
         pause ;;
-      3) systemctl restart nginx && ok "Restart ပြီး"; pause ;;
+      3) systemctl restart nginx && ok "Restarted"; pause ;;
       4) nginx -t; pause ;;
       0) return ;;
-      *) err "မှားနေပါတယ်"; sleep 1 ;;
+      *) err "Invalid choice"; sleep 1 ;;
     esac
   done
 }
@@ -226,11 +226,11 @@ install_docker() {
   header
   echo -e "${BOLD}== Docker Install ==${NC}"
   if command -v docker >/dev/null; then
-    ok "Docker ရှိပြီးသားပါ: $(docker --version)"
+    ok "Docker already installed: $(docker --version)"
   else
     curl -fsSL https://get.docker.com | sh
     systemctl enable --now docker
-    ok "Docker install ပြီး"
+    ok "Docker installed"
   fi
   pause
 }
@@ -242,16 +242,16 @@ swap_menu() {
   swapon --show
   echo
   if swapon --show | grep -q '/swapfile'; then
-    warn "Swapfile ရှိပြီးသားပါ"
+    warn "Swapfile already exists"
   else
-    read -rp "Swap အရွယ်အစား GB (ဥပမာ 2): " s
+    read -rp "Swap size in GB (e.g. 2): " s
     if [[ $s =~ ^[0-9]+$ ]] && (( s>0 )); then
       fallocate -l "${s}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=$((s*1024))
       chmod 600 /swapfile
       mkswap /swapfile && swapon /swapfile
       grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      ok "Swap ${s}GB ဖန်တီးပြီး"
-    else err "တန်ဖိုးမှားနေပါတယ်"; fi
+      ok "Swap ${s}GB created"
+    else err "Invalid value"; fi
   fi
   pause
 }
@@ -260,11 +260,11 @@ swap_menu() {
 backup_menu() {
   header
   echo -e "${BOLD}== Backup ==${NC}"
-  read -rp "Backup ယူမယ့် folder (ဥပမာ /var/www): " src
-  [[ -d $src ]] || { err "Folder မရှိပါ"; pause; return; }
+  read -rp "Folder to back up (e.g. /var/www): " src
+  [[ -d $src ]] || { err "Folder not found"; pause; return; }
   mkdir -p /root/backups
   out="/root/backups/$(basename "$src")-$(date +%F-%H%M).tar.gz"
-  tar -czf "$out" "$src" && ok "Backup ပြီး: $out ($(du -h "$out" | cut -f1))"
+  tar -czf "$out" "$src" && ok "Backup done: $out ($(du -h "$out" | cut -f1))"
   pause
 }
 
@@ -295,7 +295,7 @@ net_menu() {
 
 # ---------- 12. Reboot ----------
 do_reboot() {
-  read -rp "Reboot လုပ်မှာ သေချာလား? (yes/no): " a
+  read -rp "Reboot now? (yes/no): " a
   [[ $a == yes ]] && reboot
 }
 
@@ -304,41 +304,41 @@ cf_installed() { command -v cloudflared >/dev/null 2>&1; }
 
 cf_install() {
   if cf_installed; then
-    ok "cloudflared ရှိပြီးသားပါ: $(cloudflared --version 2>&1 | head -n1)"
+    ok "cloudflared already installed: $(cloudflared --version 2>&1 | head -n1)"
     return 0
   fi
-  echo "cloudflared install လုပ်နေပါတယ်..."
+  echo "Installing cloudflared..."
   mkdir -p --mode=0755 /usr/share/keyrings
   if ! curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
       -o /usr/share/keyrings/cloudflare-main.gpg; then
-    err "Cloudflare key ဒေါင်းလို့မရပါ (internet စစ်ပါ)"; return 1
+    err "Could not download Cloudflare key (check internet)"; return 1
   fi
   echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
     > /etc/apt/sources.list.d/cloudflared.list
   apt-get update -y && apt-get install -y cloudflared
-  if cf_installed; then ok "cloudflared install ပြီး"; else err "Install မအောင်မြင်ပါ"; return 1; fi
+  if cf_installed; then ok "cloudflared installed"; else err "Install failed"; return 1; fi
 }
 
 cf_connect() {
   cf_install || return 1
   echo
-  echo -e "${BOLD}Cloudflare Zero Trust > Networks > Tunnels${NC} ထဲက Tunnel token ကို paste လုပ်ပါ။"
-  echo "(token အစက eyJ... ဖြစ်ပါတယ်။ install command တစ်ခုလုံး paste လုပ်လည်းရပါတယ်)"
-  echo "Paste လုပ်တာ screen မှာ မပေါ်ပါဘူး။"
+  echo -e "${BOLD}Cloudflare Zero Trust > Networks > Tunnels${NC} -> copy your Tunnel token and paste it below."
+  echo "(Token starts with eyJ... You can also paste the whole install command)"
+  echo "Pasted text is hidden on screen."
   read -rsp "Token: " raw; echo
 
-  # command တစ်ခုလုံး paste လုပ်ထားရင် token ကိုပဲ ထုတ်ယူ
+  # If the whole command was pasted, extract only the token
   local token
   token=$(echo "$raw" | tr -d '[:space:]' | sed -E 's/.*(eyJ[A-Za-z0-9_=-]+)$/\1/')
 
   if [[ ! $token =~ ^eyJ[A-Za-z0-9_=-]{40,}$ ]]; then
-    err "Token ပုံစံ မမှန်ပါ"
+    err "Invalid token format"
     return 1
   fi
 
-  # service ရှိပြီးသားဆိုရင် အရင်ဖယ်
+  # If a service already exists, remove it first
   if systemctl list-unit-files 2>/dev/null | grep -q '^cloudflared.service'; then
-    warn "Tunnel service ရှိပြီးသားပါ၊ အသစ်နဲ့ အစားထိုးပါမယ်..."
+    warn "Tunnel service already exists, replacing it..."
     cloudflared service uninstall >/dev/null 2>&1
   fi
 
@@ -346,13 +346,13 @@ cf_connect() {
     systemctl enable --now cloudflared >/dev/null 2>&1
     sleep 3
     if systemctl is-active --quiet cloudflared; then
-      ok "Tunnel ချိတ်ဆက်ပြီးပါပြီ"
-      echo "Hostname/Service (ဥပမာ http://localhost:80) ကို Cloudflare Dashboard ထဲမှာ သတ်မှတ်ပါ။"
+      ok "Tunnel connected"
+      echo "Set the Hostname/Service (e.g. http://localhost:80) in the Cloudflare Dashboard."
     else
-      err "Service မ run ပါ။ Logs ကြည့်ပါ (option 4)"
+      err "Service is not running. Check logs (option 4)"
     fi
   else
-    err "Tunnel service install မအောင်မြင်ပါ"
+    err "Tunnel service install failed"
   fi
   unset raw token
 }
@@ -367,33 +367,33 @@ cf_menu() {
       [[ $st == active ]] && st="${GREEN}running${NC}" || st="${RED}${st:-not installed}${NC}"
       echo -e " Status: $st   ($(cloudflared --version 2>&1 | head -n1))"
     else
-      echo -e " Status: ${YELLOW}cloudflared မ install ရသေးပါ${NC}"
+      echo -e " Status: ${YELLOW}cloudflared not installed${NC}"
     fi
     echo
-    echo " 1) Tunnel token ထည့်ပြီး ချိတ်ဆက်မယ်"
-    echo " 2) Status ကြည့်မယ်"
+    echo " 1) Enter tunnel token and connect"
+    echo " 2) Show status"
     echo " 3) Restart"
-    echo " 4) Logs ကြည့်မယ် (နောက်ဆုံး 50 line)"
-    echo " 5) Tunnel ဖြုတ်မယ် (service uninstall)"
-    echo " 6) cloudflared ကို update လုပ်မယ်"
-    echo " 0) နောက်သို့"
-    read -rp "ရွေးပါ: " c
+    echo " 4) Show logs (last 50 lines)"
+    echo " 5) Remove tunnel (service uninstall)"
+    echo " 6) Update cloudflared"
+    echo " 0) Back"
+    read -rp "Choose: " c
     case $c in
       1) cf_connect; pause ;;
       2) systemctl status cloudflared --no-pager 2>&1 | head -n 20; pause ;;
-      3) systemctl restart cloudflared && ok "Restart ပြီး"; pause ;;
+      3) systemctl restart cloudflared && ok "Restarted"; pause ;;
       4) journalctl -u cloudflared -n 50 --no-pager; pause ;;
       5)
-        read -rp "Tunnel ဖြုတ်မှာ သေချာလား? (yes/no): " a
+        read -rp "Remove tunnel? (yes/no): " a
         if [[ $a == yes ]]; then
-          cloudflared service uninstall && ok "Tunnel service ဖြုတ်ပြီး"
+          cloudflared service uninstall && ok "Tunnel service removed"
         fi
         pause ;;
       6)
         apt-get update -y && apt-get install -y --only-upgrade cloudflared
-        ok "Update ပြီး"; pause ;;
+        ok "Updated"; pause ;;
       0) return ;;
-      *) err "မှားနေပါတယ်"; sleep 1 ;;
+      *) err "Invalid choice"; sleep 1 ;;
     esac
   done
 }
@@ -798,15 +798,15 @@ PYEOF
 wp_set_password() {
   local u pw1 pw2
   read -rp "Admin username [admin]: " u; u=${u:-admin}
-  if [[ ! $u =~ ^[A-Za-z0-9_.-]{3,32}$ ]]; then err "Username မှားနေပါတယ် (3-32 လုံး၊ အက္ခရာ/ဂဏန်း)"; return 1; fi
-  read -rsp "Password (အနည်းဆုံး 10 လုံး): " pw1; echo
-  read -rsp "Password ထပ်ရိုက်ပါ: " pw2; echo
-  if [[ $pw1 != "$pw2" ]]; then err "Password မတူပါ"; return 1; fi
+  if [[ ! $u =~ ^[A-Za-z0-9_.-]{3,32}$ ]]; then err "Invalid username (3-32 chars: letters, digits, _ . -)"; return 1; fi
+  read -rsp "Password (min 10 characters): " pw1; echo
+  read -rsp "Repeat password: " pw2; echo
+  if [[ $pw1 != "$pw2" ]]; then err "Passwords do not match"; return 1; fi
   if printf '%s' "$pw1" | python3 "$WP_APP" --set-password "$u"; then
     chmod 600 "$WP_CONF"
-    ok "Admin '$u' အတွက် password သတ်မှတ်ပြီး"
+    ok "Password set for admin '$u'"
   else
-    err "Password မသတ်မှတ်နိုင်ပါ"; return 1
+    err "Could not set password"; return 1
   fi
 }
 
@@ -820,9 +820,9 @@ wp_install() {
   wp_write_app
 
   local port
-  read -rp "Panel port (localhost မှာသာ listen လုပ်မယ်) [8080]: " port; port=${port:-8080}
-  if [[ ! $port =~ ^[0-9]+$ ]] || (( port<1024 || port>65535 )); then err "Port မှားနေပါတယ်"; pause; return; fi
-  if ss -ltn | awk '{print $4}' | grep -qE "[:.]${port}$"; then err "Port $port ကို တခြားက သုံးနေပါတယ်"; pause; return; fi
+  read -rp "Panel port (listens on localhost only) [8080]: " port; port=${port:-8080}
+  if [[ ! $port =~ ^[0-9]+$ ]] || (( port<1024 || port>65535 )); then err "Invalid port"; pause; return; fi
+  if ss -ltn | awk '{print $4}' | grep -qE "[:.]${port}$"; then err "Port $port is already in use"; pause; return; fi
   python3 "$WP_APP" --set-port "$port" || { pause; return; }
 
   wp_set_password || { pause; return; }
@@ -849,9 +849,9 @@ EOF
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/login")
   if [[ $code == 200 ]]; then
-    ok "Web panel run နေပါပြီ (http://127.0.0.1:${port})"
+    ok "Web panel is running (http://127.0.0.1:${port})"
   else
-    err "Panel မစတင်ပါ (HTTP $code)။ Logs: journalctl -u $WP_SVC -n 30"
+    err "Panel failed to start (HTTP $code). Logs: journalctl -u $WP_SVC -n 30"
     pause; return
   fi
   wp_tunnel_help "$port"
@@ -861,21 +861,21 @@ EOF
 wp_tunnel_help() {
   local port=${1:-$(wp_port)}
   echo
-  echo -e "${BOLD}Cloudflare Tunnel နဲ့ domain ချိတ်ရန်:${NC}"
-  echo " 1) Cloudflare Zero Trust > Networks > Tunnels > (သင့် tunnel) > Edit"
+  echo -e "${BOLD}Connect your domain via Cloudflare Tunnel:${NC}"
+  echo " 1) Cloudflare Zero Trust > Networks > Tunnels > (your tunnel) > Edit"
   echo " 2) Published application / Public hostname > Add"
-  echo "      Subdomain : panel   (ဥပမာ)"
-  echo "      Domain    : သင့် domain ကို ရွေးပါ"
+  echo "      Subdomain : panel   (example)"
+  echo "      Domain    : choose your domain"
   echo "      Type      : HTTP"
   echo "      URL       : localhost:${port}"
-  echo " 3) Save လုပ်ပြီး https://panel.yourdomain.com ကို ဖွင့်ပါ"
+  echo " 3) Save, then open https://panel.yourdomain.com"
   echo
-  echo -e "${YELLOW}လုံခြုံရေး အကြံပြုချက်:${NC} Zero Trust > Access > Applications မှာ"
-  echo "ဒီ hostname အတွက် Access policy (email OTP/Google login) ထပ်ထည့်ပါ။"
-  echo "ဒါဆို panel login မတိုင်ခင် Cloudflare က အရင်စစ်ပေးပါမယ်။"
+  echo -e "${YELLOW}Security tip:${NC} In Zero Trust > Access > Applications,"
+  echo "add an Access policy (email OTP / Google login) for this hostname."
+  echo "Cloudflare will then verify visitors before they reach the panel login."
   if ! systemctl is-active --quiet cloudflared 2>/dev/null; then
     echo
-    warn "cloudflared မ run သေးပါ။ Menu 13 ကနေ Tunnel token အရင်ချိတ်ပါ။"
+    warn "cloudflared is not running. Connect your Tunnel token first via menu 13."
   fi
 }
 
@@ -889,39 +889,39 @@ wp_menu() {
       [[ $st == active ]] && st="${GREEN}running${NC}" || st="${RED}${st:-stopped}${NC}"
       echo -e " Status: $st   Local: http://127.0.0.1:$(wp_port)"
     else
-      echo -e " Status: ${YELLOW}မ install ရသေးပါ${NC}"
+      echo -e " Status: ${YELLOW}not installed${NC}"
     fi
     echo
     echo " 1) Install / Reinstall"
-    echo " 2) Status ကြည့်မယ်"
-    echo " 3) Admin password ပြောင်းမယ်"
+    echo " 2) Show status"
+    echo " 3) Change admin password"
     echo " 4) Restart"
-    echo " 5) Logs ကြည့်မယ် (login အောင်/မအောင် ပါ)"
-    echo " 6) Cloudflare Tunnel ချိတ်ပုံ (hostname/port)"
-    echo " 7) Panel code update (config မပျက်ပါ)"
+    echo " 5) Show logs (includes login attempts)"
+    echo " 6) Cloudflare Tunnel setup help (hostname/port)"
+    echo " 7) Update panel code (keeps config)"
     echo " 8) Uninstall"
-    echo " 0) နောက်သို့"
-    read -rp "ရွေးပါ: " c
+    echo " 0) Back"
+    read -rp "Choose: " c
     case $c in
       1) wp_install ;;
       2) systemctl status "$WP_SVC" --no-pager 2>&1 | head -n 15; pause ;;
-      3) if wp_installed; then wp_set_password && systemctl restart "$WP_SVC" && ok "Session အားလုံး logout ဖြစ်သွားပါပြီ"; else err "အရင် install လုပ်ပါ"; fi; pause ;;
-      4) systemctl restart "$WP_SVC" && ok "Restart ပြီး"; pause ;;
+      3) if wp_installed; then wp_set_password && systemctl restart "$WP_SVC" && ok "All sessions have been logged out"; else err "Install the panel first"; fi; pause ;;
+      4) systemctl restart "$WP_SVC" && ok "Restarted"; pause ;;
       5) journalctl -u "$WP_SVC" -n 50 --no-pager; pause ;;
       6) wp_tunnel_help; pause ;;
-      7) if wp_installed; then wp_write_app && systemctl restart "$WP_SVC" && ok "Update ပြီး"; else err "အရင် install လုပ်ပါ"; fi; pause ;;
+      7) if wp_installed; then wp_write_app && systemctl restart "$WP_SVC" && ok "Updated"; else err "Install the panel first"; fi; pause ;;
       8)
-        read -rp "Web panel ဖြုတ်မှာ သေချာလား? (yes/no): " a
+        read -rp "Remove web panel? (yes/no): " a
         if [[ $a == yes ]]; then
           systemctl disable --now "$WP_SVC" 2>/dev/null
           rm -f /etc/systemd/system/${WP_SVC}.service
           rm -rf "$WP_DIR" /etc/vps-webpanel
           systemctl daemon-reload
-          ok "ဖြုတ်ပြီး။ Cloudflare Dashboard ထဲက hostname ကိုလည်း ဖျက်ပါ။"
+          ok "Removed. Also delete the hostname in the Cloudflare Dashboard."
         fi
         pause ;;
       0) return ;;
-      *) err "မှားနေပါတယ်"; sleep 1 ;;
+      *) err "Invalid choice"; sleep 1 ;;
     esac
   done
 }
@@ -943,10 +943,10 @@ main_menu() {
     echo -e " ${GREEN}11)${NC} Network Check"
     echo -e " ${GREEN}12)${NC} Reboot"
     echo -e " ${GREEN}13)${NC} Cloudflare Tunnel"
-    echo -e " ${GREEN}14)${NC} Web Panel (Tunnel နဲ့ဝင်ရန်)"
+    echo -e " ${GREEN}14)${NC} Web Panel (access via Tunnel)"
     echo -e " ${RED}0)${NC}  Exit"
     echo
-    read -rp " ရွေးပါ: " choice
+    read -rp " Choose: " choice
     case $choice in
       1) sys_info ;;
       2) sys_update ;;
@@ -962,8 +962,8 @@ main_menu() {
       12) do_reboot ;;
       13) cf_menu ;;
       14) wp_menu ;;
-      0) echo "ကျေးဇူးတင်ပါတယ်!"; exit 0 ;;
-      *) err "မှားနေပါတယ်"; sleep 1 ;;
+      0) echo "Goodbye!"; exit 0 ;;
+      *) err "Invalid choice"; sleep 1 ;;
     esac
   done
 }
