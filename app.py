@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # =====================================================
-#  TBP - Userbot Web Panel v2.0  (single file, Python 3.10+ stdlib only)
-#  - Multi-user: admin creates accounts and generates passwords
-#  - Users upload .py / .js bots, packages auto-installed per bot
+#  TBP - Userbot Web Panel v2.1  (single file, Python 3.10+ stdlib only)
+#  - Key login (no passwords): admin issues one access key per user, shown once
+#  - Users upload .py / .js bots; packages auto-installed per bot
 #  - Code scanner rejects bot-hosting, server-control and malware patterns
 #  - Bots run as unprivileged system user 'tbpbot' when panel runs as root
 #  - POLICY: opencv-python*, numpy, ddddocr are NEVER installed
 #  Listens on 127.0.0.1 only. Publish via Cloudflare Tunnel.
-#  Setup:  sudo python3 app.py --set-password admin
-#  Run:    sudo python3 app.py   ->  http://127.0.0.1:8787
+#  Admin key:  sudo python3 app.py --set-password admin   (same as --new-key admin)
+#  Run:        sudo python3 app.py   ->  http://127.0.0.1:8787
 # =====================================================
-import ast, getpass, hashlib, hmac, html, json, os, pwd, re, secrets, shutil, signal, subprocess, sys, threading, time, traceback
+import ast, hashlib, hmac, html, json, os, pwd, re, secrets, shutil, signal, subprocess, sys, threading, time, traceback
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.0"
+VERSION = "2.1"
 HOME = os.environ.get("TBP_HOME", "/opt/tb-panel")
 CONF = os.path.join(HOME, "config.json")
 BOTS = os.path.join(HOME, "bots")
@@ -26,7 +26,6 @@ MAX_UPLOAD = 2 * 1024 * 1024
 SESSION_TTL = 8 * 3600
 MAX_FAILS, LOCK_SECS = 5, 300
 MAX_RESTARTS = 5
-PBKDF_ITER = 200000
 
 SESSIONS, FAILS, PROCS = {}, {}, {}
 LOCK = threading.RLock()
@@ -54,6 +53,7 @@ JS_RE = [re.compile(r"""require\(\s*['"]([^'"]+)['"]\s*\)"""),
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 BID_RE = r"[0-9a-f]{12}"
 NAME_RE = re.compile(r"[a-z0-9_.-]{3,32}")
+KEY_RE = re.compile(r"tbp_([0-9a-f]{8})\.([A-Za-z0-9_-]{40,64})")
 
 # ---- code scanner rules: (category, regex), checked line by line ----
 RULES = [
@@ -143,28 +143,39 @@ def read_text(p):
         return f.read()
 
 
-# ---------- passwords / accounts ----------
-def hash_pw(pw, salt):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), PBKDF_ITER).hex()
+# ---------- access keys / accounts ----------
+def key_digest(secret):
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
-def new_pw_fields(pw):
-    salt = secrets.token_hex(16)
-    return {"salt": salt, "hash": hash_pw(pw, salt)}
+def issue_key(rec):
+    """Creates a new key for the account record (in place). Returns the full key once."""
+    kid = secrets.token_hex(4)               # public id, used for lookup
+    secret = secrets.token_urlsafe(32)       # private part, never stored
+    rec.pop("salt", None)
+    rec.pop("hash", None)
+    rec.update(key_id=kid, key_hash=key_digest(secret))
+    return "tbp_%s.%s" % (kid, secret)
 
 
-def new_record(pw, role, must_change=False):
-    rec = new_pw_fields(pw)
-    rec.update(role=role, disabled=False, must_change=must_change, created=time.time())
-    return rec
+def find_by_key(users, key):
+    m = KEY_RE.fullmatch((key or "").strip())
+    if not m:
+        return None, None
+    kid, secret = m.group(1), m.group(2)
+    digest = key_digest(secret)
+    for name, rec in users.items():
+        if rec.get("key_id") == kid and hmac.compare_digest(digest, rec.get("key_hash", "")):
+            return name, rec
+    return None, None
 
 
-def verify_pw(pw, rec):
-    return hmac.compare_digest(hash_pw(pw, rec["salt"]), rec["hash"])
+def has_key(rec):
+    return bool(rec.get("key_id") and rec.get("key_hash"))
 
 
-def gen_password():
-    return secrets.token_urlsafe(12)
+def new_record(role):
+    return {"role": role, "disabled": False, "created": time.time()}
 
 
 def valid_name(n):
@@ -173,11 +184,11 @@ def valid_name(n):
 
 def users_load():
     conf = read_json(CONF, {})
-    if "users" in conf and isinstance(conf["users"], dict):
-        return conf["users"]
-    if conf.get("hash") and conf.get("salt"):          # migrate v1 single-admin config
-        return {conf.get("user", "admin"): {"role": "admin", "salt": conf["salt"], "hash": conf["hash"],
-                                            "disabled": False, "must_change": False, "created": time.time()}}
+    users = conf.get("users")
+    if isinstance(users, dict):
+        return users
+    if conf.get("user"):                      # migrate v1 single-admin config (no key yet)
+        return {conf["user"]: new_record("admin")}
     return {}
 
 
@@ -186,33 +197,24 @@ def users_save(users):
 
 
 def active_admins(users):
-    return [n for n, r in users.items() if r.get("role") == "admin" and not r.get("disabled")]
+    return [n for n, r in users.items() if r.get("role") == "admin" and not r.get("disabled") and has_key(r)]
 
 
-def read_secret():
-    if sys.stdin.isatty():
-        a = getpass.getpass("Password (min 10 chars): ")
-        b = getpass.getpass("Repeat password: ")
-        if a != b:
-            sys.exit("Passwords do not match")
-        return a
-    return sys.stdin.read().rstrip("\n")
-
-
-def cli_set_password(name):
+def cli_new_key(name):
     name = name.strip().lower()
     if not valid_name(name):
         sys.exit("Invalid username (3-32 chars: a-z, 0-9, _ . -)")
-    pw = read_secret()
-    if len(pw) < 10:
-        sys.exit("Password must be at least 10 characters")
     users = users_load()
-    if name in users:
-        users[name].update(new_pw_fields(pw), must_change=False, disabled=False)
-    else:
-        users[name] = new_record(pw, "admin")
+    if name not in users:
+        users[name] = new_record("admin")
+    rec = users[name]
+    rec["disabled"] = False
+    key = issue_key(rec)
     users_save(users)
-    print("Password saved for '%s' (role: %s)" % (name, users[name].get("role")))
+    print("")
+    print("Access key for '%s' (role: %s) - shown ONCE, save it now:" % (name, rec.get("role")))
+    print(key)
+    print("")
 
 
 def stats():
@@ -603,9 +605,9 @@ def watchdog():
         time.sleep(10)
 
 
-def kill_sessions(name):
+def kill_sessions(name, keep=None):
     with LOCK:
-        for t in [t for t, v in SESSIONS.items() if v.get("user") == name]:
+        for t in [t for t, v in SESSIONS.items() if v.get("user") == name and t != keep]:
             SESSIONS.pop(t, None)
 
 
@@ -716,7 +718,7 @@ button:active,.btn:active{transform:scale(.97)}
 .btn.ok{background:rgba(52,211,153,.15);border-color:rgba(52,211,153,.45);color:#a7f3d0}
 .btn.dng{background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.45);color:#fecdd3}
 .btn.ghost{background:transparent}.btn.sm{padding:5px 11px;font-size:13px}.wide{width:100%}
-input[type=text],input[type=password],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt)}
+input[type=text],input[type=password],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt);font-family:ui-monospace,Menlo,Consolas,monospace}
 input:focus,select:focus{outline:2px solid rgba(34,211,238,.45);border-color:transparent}
 label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 .mini{display:inline-flex;gap:5px;align-items:center;font-weight:500;color:var(--mut);margin-left:4px}
@@ -729,7 +731,7 @@ label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 .flash.ok{color:#a7f3d0;border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.1)}
 .flash.bad{color:#fecdd3;border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.1)}
 .reveal{border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);border-radius:16px;padding:14px;margin:12px 0}
-.reveal code{display:block;margin-top:8px;padding:10px;border-radius:10px;background:rgba(3,4,12,.85);font-size:16px;letter-spacing:.06em;word-break:break-all;color:#fde68a}
+.reveal code{display:block;margin-top:8px;padding:10px;border-radius:10px;background:rgba(3,4,12,.85);font-size:15px;letter-spacing:.04em;word-break:break-all;color:#fde68a}
 pre.log{white-space:pre-wrap;word-break:break-word;background:rgba(3,4,12,.85);border:1px solid var(--line);border-radius:14px;padding:14px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;color:#cbd5e1;max-height:60vh;overflow:auto;margin:0}
 .log .err{color:#fda4af}.log .warn{color:#fde68a}.log .sep{color:var(--c1);font-weight:700}
 .empty{color:var(--mut);text-align:center;padding:24px}
@@ -765,6 +767,16 @@ def layout(s, title, body, active="", refresh=0):
            "<button class='btn ghost sm'>Logout</button></form></nav></header>")
     foot = "<footer>TBP v%s</footer>" % VERSION
     return page(title, top + flash + body + foot, refresh)
+
+
+def reveal_box(s):
+    with LOCK:
+        rv = s.pop("reveal", None)
+    if not rv:
+        return ""
+    return ("<div class=reveal><b>Access key for " + esc(rv[0]) + "</b> "
+            "<span class=mut>— copy it now, it will not be shown again</span>"
+            "<code>" + esc(rv[1]) + "</code></div>")
 
 
 def tile(label, value, p=None, sub=""):
@@ -877,12 +889,11 @@ class H(BaseHTTPRequestHandler):
                 SESSIONS.pop(m.value, None)
                 return None
         rec = users_load().get(s["user"])
-        if not rec or rec.get("disabled"):
+        if not rec or rec.get("disabled") or not has_key(rec):
             with LOCK:
                 SESSIONS.pop(m.value, None)
             return None
         s["role"] = rec.get("role", "user")
-        s["must_change"] = bool(rec.get("must_change"))
         return s
 
     def _error(self):
@@ -906,8 +917,6 @@ class H(BaseHTTPRequestHandler):
         s = self.sess()
         if not s:
             return self.go("/login")
-        if s["must_change"] and path != "/account":
-            return self.go("/account")
         if path == "/":
             return self.dash(s)
         if path == "/account":
@@ -956,27 +965,27 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 SESSIONS.pop(s["tok"], None)
             return self.go("/login", [("Set-Cookie", "sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")])
-        if s["must_change"] and path != "/account/password":
-            return self.go("/account")
         if path == "/upload":
             return self.do_upload(s, fields, files)
         if path == "/action":
             return self.do_action(s, fields)
         if path == "/users/action":
             return self.do_user_action(s, fields)
-        if path == "/account/password":
-            return self.do_password(s, fields)
+        if path == "/account/key":
+            return self.do_own_key(s, fields)
         self.send_html(404, layout(s, "Not found", "<h1>Not found</h1>", "dash"))
 
     # ----- auth -----
     def login_page(self, err=""):
         e = "<div class='flash bad'>%s</div>" % esc(err) if err else ""
         body = ("<div class=auth><div class=authbox><div class=center><span class=logo>TBP</span></div>"
-                "<p class='center mut'>Userbot control panel</p>" + e +
+                "<p class='center mut'>Enter your access key</p>" + e +
                 "<div class=card><form method=post action=/login>"
-                "<label>Username</label><input type=text name=u autocomplete=username required>"
-                "<label>Password</label><input type=password name=p autocomplete=current-password required>"
-                "<button class='btn pri wide'>Sign in</button></form></div></div></div>")
+                "<label>Access key</label>"
+                "<input type=password name=key autocomplete=off autocapitalize=off spellcheck=false required placeholder='tbp_...'>"
+                "<button class='btn pri wide'>Sign in</button></form>"
+                "<p class='mut center' style='font-size:12px;margin-top:12px'>No key? Ask the admin.</p>"
+                "</div></div></div>")
         self.send_html(200, page("TBP · Login", body))
 
     def do_login(self, f):
@@ -987,16 +996,9 @@ class H(BaseHTTPRequestHandler):
             until = FAILS.get(ip, [0, 0])[1]
         if until > now:
             return self.send_html(429, page("Locked", "<p class=center>Too many attempts. Wait a few minutes.</p>"))
-        name = f.get("u", "").strip().lower()
-        pw = f.get("p", "")
         users = users_load()
-        rec = users.get(name)
-        if rec:
-            pw_ok = verify_pw(pw, rec)
-        else:
-            hash_pw(pw, "00" * 16)                      # equalize timing for unknown users
-            pw_ok = False
-        if not pw_ok or (rec and rec.get("disabled")):
+        name, rec = find_by_key(users, f.get("key", ""))
+        if not name or rec.get("disabled"):
             with LOCK:
                 c, until = FAILS.get(ip, [0, 0])
                 c += 1
@@ -1005,15 +1007,14 @@ class H(BaseHTTPRequestHandler):
                 FAILS[ip] = [c, until]
             sys.stderr.write("LOGIN FAILED from %s\n" % ip)
             time.sleep(1)
-            return self.login_page("Invalid username or password")
+            return self.login_page("Invalid or disabled access key")
         tok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         with LOCK:
             FAILS.pop(ip, None)
             for k in [k for k, v in SESSIONS.items() if v["exp"] <= now]:
                 SESSIONS.pop(k, None)
             SESSIONS[tok] = {"exp": now + SESSION_TTL, "csrf": csrf, "flash": None, "tok": tok,
-                             "user": name, "role": rec.get("role", "user"),
-                             "must_change": bool(rec.get("must_change")), "reveal": None}
+                             "user": name, "role": rec.get("role", "user"), "reveal": None}
         cookie = "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s" % (
             tok, SESSION_TTL, "; Secure" if self.secure() else "")
         sys.stderr.write("LOGIN OK %s from %s\n" % (name, ip))
@@ -1101,32 +1102,23 @@ class H(BaseHTTPRequestHandler):
         self.send_html(200, layout(s, "TBP · Logs", body, "dash", refresh))
 
     def account_page(self, s):
-        warn = ("<div class='flash bad'>Your password was reset by an admin. Set a new password to continue.</div>"
-                if s["must_change"] else "")
         body = ("<h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · " + esc(s["role"]) + "</div>"
-                + warn +
-                "<h2>Change password</h2><div class=card><form method=post action=/account/password>"
+                + reveal_box(s) +
+                "<h2>My access key</h2><div class=card>"
+                "<p class=mut style='margin-top:0'>Lost your key? Generate a new one. Your old key and your other "
+                "sessions stop working immediately.</p>"
+                "<form method=post action=/account/key>"
                 "<input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
-                "<label>Current password</label><input type=password name=old autocomplete=current-password required>"
-                "<label>New password (min 10 characters)</label><input type=password name=new autocomplete=new-password required>"
-                "<label>Repeat new password</label><input type=password name=new2 autocomplete=new-password required>"
-                "<button class='btn pri wide'>Update password</button></form></div>")
+                "<label class=chk><input type=checkbox name=confirm value=yes required> I understand my current key will stop working</label>"
+                "<button class='btn pri wide'>Generate new key</button></form></div>")
         self.send_html(200, layout(s, "TBP · Account", body, "acct"))
 
     def users_page(self, s):
         users = users_load()
-        bots = list_bots()
         counts = {}
-        for m in bots:
+        for m in list_bots():
             counts[m.get("owner")] = counts.get(m.get("owner"), 0) + 1
-        with LOCK:
-            rv = s.get("reveal")
-            s["reveal"] = None
         csrf = s["csrf"]
-        reveal = ""
-        if rv:
-            reveal = ("<div class=reveal><b>Password for " + esc(rv[0]) + "</b> "
-                      "<span class=mut>— copy it now, it will not be shown again</span><code>" + esc(rv[1]) + "</code></div>")
         rows = ""
         for name in sorted(users):
             r = users[name]
@@ -1135,16 +1127,17 @@ class H(BaseHTTPRequestHandler):
             disabled = bool(r.get("disabled"))
             badge = "<span class='pill info'>admin</span>" if is_admin else "<span class='pill mut'>user</span>"
             status = "<span class='pill bad'>disabled</span>" if disabled else "<span class='pill ok'>active</span>"
-            flag = " <span class=tag2>must change password</span>" if r.get("must_change") else ""
+            if not has_key(r):
+                status += " <span class='pill warn'>no key</span>"
             if me:
                 acts = "<span class=kv>(you — use Account page)</span>"
             else:
-                acts = ufm(csrf, "reset", name, "Reset password", "sm")
+                acts = ufm(csrf, "reset", name, "New key", "sm")
                 acts += ufm(csrf, "toggle", name, "Enable" if disabled else "Disable", "sm" if disabled else "sm dng")
                 acts += ufm(csrf, "role", name, "Make user" if is_admin else "Make admin", "sm")
                 acts += ufm(csrf, "delete", name, "Delete", "sm dng",
                             "<label class=mini><input type=checkbox name=confirm value=yes required> confirm</label>")
-            rows += ("<div class=row><div><div class=name>" + esc(name) + " " + badge + flag + "</div>"
+            rows += ("<div class=row><div><div class=name>" + esc(name) + " " + badge + "</div>"
                      "<div class=kv>bots: <b>" + str(counts.get(name, 0)) + "</b> · created " + fmt_time(r.get("created")) +
                      "</div></div><div class=acts>" + status + " " + acts + "</div></div>")
         create = ("<div class=card><form method=post action=/users/action>"
@@ -1153,9 +1146,9 @@ class H(BaseHTTPRequestHandler):
                   "<label>Username (a-z, 0-9, _ . - · 3-32 chars)</label>"
                   "<input type=text name=user autocomplete=off required>"
                   "<label>Role</label><select name=role><option value=user>User</option><option value=admin>Admin</option></select>"
-                  "<button class='btn pri wide'>Create account &amp; generate password</button></form></div>")
-        body = ("<h1>Users</h1><div class=mut>Create accounts, reset passwords, disable or delete users</div>"
-                + reveal + "<h2>Accounts</h2><div class=card>" + rows + "</div>"
+                  "<button class='btn pri wide'>Create account &amp; generate key</button></form></div>")
+        body = ("<h1>Users</h1><div class=mut>Create accounts, issue access keys, disable or delete users</div>"
+                + reveal_box(s) + "<h2>Accounts</h2><div class=card>" + rows + "</div>"
                 "<h2>New account</h2>" + create)
         self.send_html(200, layout(s, "TBP · Users", body, "users"))
 
@@ -1259,29 +1252,28 @@ class H(BaseHTTPRequestHandler):
                 return self.flash_go(s, "bad", "Username already exists", back)
             if role not in ("user", "admin"):
                 role = "user"
-            pw = gen_password()
-            users[name] = new_record(pw, role, must_change=True)
+            users[name] = new_record(role)
+            key = issue_key(users[name])
             users_save(users)
             with LOCK:
-                s["reveal"] = (name, pw)
-            return self.flash_go(s, "ok", "Account created - password shown below (once)", back)
+                s["reveal"] = (name, key)
+            return self.flash_go(s, "ok", "Account created - key shown below (once)", back)
 
         if name not in users:
             return self.flash_go(s, "bad", "User not found", back)
         if name == s["user"]:
-            return self.flash_go(s, "bad", "Use the Account page for your own password and settings", back)
+            return self.flash_go(s, "bad", "Use the Account page for your own key", back)
         rec = users[name]
         admins_on = active_admins(users)
         is_last_admin = rec.get("role") == "admin" and name in admins_on and len(admins_on) == 1
 
         if act == "reset":
-            pw = gen_password()
-            rec.update(new_pw_fields(pw), must_change=True)
+            key = issue_key(rec)
             users_save(users)
             kill_sessions(name)
             with LOCK:
-                s["reveal"] = (name, pw)
-            return self.flash_go(s, "ok", "Password reset - give it to the user (shown once)", back)
+                s["reveal"] = (name, key)
+            return self.flash_go(s, "ok", "New key generated - give it to the user (shown once)", back)
 
         if act == "toggle":
             if not rec.get("disabled") and is_last_admin:
@@ -1315,19 +1307,19 @@ class H(BaseHTTPRequestHandler):
 
         return self.flash_go(s, "bad", "Unknown action", back)
 
-    def do_password(self, s, f):
+    def do_own_key(self, s, f):
+        if f.get("confirm") != "yes":
+            return self.flash_go(s, "bad", "Tick the confirmation box first", "/account")
         users = users_load()
         rec = users.get(s["user"])
-        if not rec or not verify_pw(f.get("old", ""), rec):
-            return self.flash_go(s, "bad", "Current password is wrong", "/account")
-        new, new2 = f.get("new", ""), f.get("new2", "")
-        if len(new) < 10:
-            return self.flash_go(s, "bad", "New password must be at least 10 characters", "/account")
-        if new != new2:
-            return self.flash_go(s, "bad", "New passwords do not match", "/account")
-        rec.update(new_pw_fields(new), must_change=False)
+        if not rec or rec.get("disabled"):
+            return self.flash_go(s, "bad", "Account unavailable", "/account")
+        key = issue_key(rec)
         users_save(users)
-        self.flash_go(s, "ok", "Password changed", "/")
+        kill_sessions(s["user"], keep=s["tok"])
+        with LOCK:
+            s["reveal"] = (s["user"], key)
+        self.go("/account")
 
 
 def main():
@@ -1335,17 +1327,18 @@ def main():
     if sys.version_info < (3, 10):
         sys.exit("TBP needs Python 3.10 or newer")
     a = sys.argv
-    if len(a) == 3 and a[1] == "--set-password":
-        return cli_set_password(a[2])
+    if len(a) == 3 and a[1] in ("--set-password", "--new-key"):
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        return cli_new_key(a[2])
     os.makedirs(BOTS, mode=0o711, exist_ok=True)
     if os.geteuid() == 0:
         os.chmod(HOME, 0o711)          # bot user must traverse to its own folder
         os.chmod(BOTS, 0o711)
     BOT_RUN_AS = ensure_bot_user()
-    users = users_load()
-    if not active_admins(users):
-        sys.exit("No active admin account. Run: sudo python3 app.py --set-password admin")
-    first_admin = sorted(active_admins(users))[0]
+    admins = active_admins(users_load())
+    if not admins:
+        sys.exit("No active admin key. Run: sudo python3 app.py --set-password admin")
+    first_admin = sorted(admins)[0]
     for m in list_bots():
         upd = {}
         if not m.get("owner"):
