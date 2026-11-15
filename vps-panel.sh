@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================
-#  TBP - VPS management menu + Web Panel (app.py)
+#  TBP - VPS management menu + Web Panel (app.py v2.1)
 #  Supports: Ubuntu / Debian
 #
 #  Run with:
@@ -11,7 +11,7 @@
 
 set -u
 
-TBP_VERSION="3.0"
+TBP_VERSION="3.1"
 
 # ---------- Theme ----------
 if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
@@ -626,6 +626,7 @@ tbp_fetch_app() {
   ok "app.py installed to $TBP_APP"
 }
 
+# Creates (or re-issues) an admin access key. app.py prints the key once.
 tbp_set_password() {
   local u
   read -rp "  Admin username [admin]: " u; u=${u:-admin}
@@ -727,10 +728,12 @@ tbp_install() {
   tbp_stop_old
   tbp_fetch_app || { pause; return; }
 
-  if [[ ! -s $TBP_CONF ]] || ! grep -q '"hash"' "$TBP_CONF"; then
+  # v2.1 stores "key_hash" per user; a missing key means first-time setup
+  if [[ ! -s $TBP_CONF ]] || ! grep -q '"key_hash"' "$TBP_CONF"; then
+    info "No admin key yet - creating one. SAVE the key shown below (it appears once)."
     tbp_set_password || { pause; return; }
   else
-    ok "Admin password already set (kept)"
+    ok "Admin access key already set (kept)"
   fi
 
   tbp_start || { pause; return; }
@@ -776,7 +779,7 @@ wp_menu() {
     fi
     echo
     opt 1 "Install / update web panel"
-    opt 2 "Change admin password"
+    opt 2 "Issue new admin key"
     opt 3 "Restart"
     opt 4 "Stop"
     opt 5 "Show status"
