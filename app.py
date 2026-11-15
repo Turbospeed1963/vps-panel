@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 # =====================================================
-#  TBP - Userbot Web Panel v1.0  (single file, Python 3.10+ stdlib only)
-#  Upload a .py / .js bot -> imports detected -> packages auto-installed
-#  -> run / stop / restart / logs from the browser.
-#  POLICY: opencv-python*, numpy, ddddocr are NEVER installed
-#          (filtered + enforced with pip constraints).
-#  Listens on 127.0.0.1 only. Publish via Cloudflare Tunnel / reverse proxy.
+#  TBP - Userbot Web Panel v2.0  (single file, Python 3.10+ stdlib only)
+#  - Multi-user: admin creates accounts and generates passwords
+#  - Users upload .py / .js bots, packages auto-installed per bot
+#  - Code scanner rejects bot-hosting, server-control and malware patterns
+#  - Bots run as unprivileged system user 'tbpbot' when panel runs as root
+#  - POLICY: opencv-python*, numpy, ddddocr are NEVER installed
+#  Listens on 127.0.0.1 only. Publish via Cloudflare Tunnel.
 #  Setup:  sudo python3 app.py --set-password admin
-#  Run:    sudo python3 app.py        ->  http://127.0.0.1:8787
+#  Run:    sudo python3 app.py   ->  http://127.0.0.1:8787
 # =====================================================
-import ast, getpass, hashlib, hmac, html, json, os, re, secrets, shutil, signal, subprocess, sys, threading, time, traceback
+import ast, getpass, hashlib, hmac, html, json, os, pwd, re, secrets, shutil, signal, subprocess, sys, threading, time, traceback
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.0"
+VERSION = "2.0"
 HOME = os.environ.get("TBP_HOME", "/opt/tb-panel")
 CONF = os.path.join(HOME, "config.json")
 BOTS = os.path.join(HOME, "bots")
 PORT = int(os.environ.get("TBP_PORT", "8787"))
+BOT_USER = "tbpbot"
+BOT_RUN_AS = None              # set at startup when running as root
 MAX_UPLOAD = 2 * 1024 * 1024
 SESSION_TTL = 8 * 3600
 MAX_FAILS, LOCK_SECS = 5, 300
 MAX_RESTARTS = 5
+PBKDF_ITER = 200000
 
 SESSIONS, FAILS, PROCS = {}, {}, {}
 LOCK = threading.RLock()
@@ -36,6 +40,8 @@ CONSTRAINTS = "\n".join(["numpy<0", "ddddocr<0", "opencv-python<0", "opencv-pyth
 PY_MAP = {"cv2": "opencv-python", "PIL": "pillow", "bs4": "beautifulsoup4", "dotenv": "python-dotenv",
           "yaml": "pyyaml", "socks": "pysocks", "nacl": "pynacl", "dateutil": "python-dateutil",
           "telegram": "python-telegram-bot"}
+BANNED_PY_MODULES = {"pty", "telnetlib", "sh"}
+BANNED_JS_MODULES = {"child_process", "node:child_process"}
 NODE_BUILTIN = {"assert", "buffer", "child_process", "cluster", "console", "constants", "crypto", "dgram",
                 "diagnostics_channel", "dns", "domain", "events", "fs", "http", "http2", "https", "inspector",
                 "module", "net", "os", "path", "perf_hooks", "process", "punycode", "querystring", "readline",
@@ -47,8 +53,25 @@ JS_RE = [re.compile(r"""require\(\s*['"]([^'"]+)['"]\s*\)"""),
          re.compile(r"""^\s*import\s+['"]([^'"]+)['"]""", re.M)]
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 BID_RE = r"[0-9a-f]{12}"
+NAME_RE = re.compile(r"[a-z0-9_.-]{3,32}")
+
+# ---- code scanner rules: (category, regex), checked line by line ----
+RULES = [
+    ("hosting", r"\b(tb-panel|vps-panel|vps-webpanel|TBP_HOME|TBP_PORT|config\.json|meta\.json)\b|/opt/(tb-panel|vps-webpanel)"),
+    ("hosting", r"\bbots/|\bbot\.log\b"),
+    ("hosting", r"\b(systemctl|journalctl|cloudflared|iptables|nginx|sshd|ufw)\b|/etc/(shadow|sudoers|passwd|ssh/)"),
+    ("hosting", r"\b(subprocess|os\.system|os\.popen|os\.spawn\w*|Popen|check_output|check_call|child_process|execSync|execFile|spawn|nohup|setsid)\b.*\b(python3?|node|npm|npx|bash|sh|nohup|setsid)\b"),
+    ("malware", r"/dev/(tcp|udp)/|\bbash\s+-i\b|\b(nc|ncat|netcat|socat)\b.*\s-(e|c)\b|\bmkfifo\b"),
+    ("malware", r"\brm\s+-rf\s+/(\s|$|\*)|\bmkfs(\.\w+)?\b|\bdd\s+if=|:\(\)\s*\{"),
+    ("malware", r"xmrig|stratum\+|minexmr|nanopool|nicehash|cryptonight|coinhive"),
+    ("malware", r"\b(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(sh|bash)\b"),
+    ("malware", r"\b(exec|eval)\s*\(.*(b64decode|base64|zlib\.decompress|marshal\.loads|codecs\.decode|fromhex|atob\(|Buffer\.from)"),
+    ("malware", r"\bchmod\s+(\+s|u\+s)\b"),
+]
+RULES_C = [(cat, re.compile(rx, re.I)) for cat, rx in RULES]
 
 
+# ---------- policy helpers ----------
 def blocked(name):
     n = name.lower().replace("_", "-")
     return n in BLOCK_EXACT or n.startswith(BLOCK_PREFIX)
@@ -78,6 +101,10 @@ def human(n):
     return "%.1f PB" % n
 
 
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts or 0))
+
+
 def run_cmd(cmd, cwd=None, timeout=900):
     try:
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
@@ -91,7 +118,7 @@ def run_cmd(cmd, cwd=None, timeout=900):
 
 def read_json(p, default):
     try:
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, type(default)) else default
     except Exception:
@@ -101,8 +128,12 @@ def read_json(p, default):
 def write_json(p, obj):
     os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
     tmp = p + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    try:
+        os.unlink(tmp)                      # never write through a leftover symlink
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
     os.replace(tmp, p)
 
@@ -112,8 +143,50 @@ def read_text(p):
         return f.read()
 
 
+# ---------- passwords / accounts ----------
 def hash_pw(pw, salt):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), PBKDF_ITER).hex()
+
+
+def new_pw_fields(pw):
+    salt = secrets.token_hex(16)
+    return {"salt": salt, "hash": hash_pw(pw, salt)}
+
+
+def new_record(pw, role, must_change=False):
+    rec = new_pw_fields(pw)
+    rec.update(role=role, disabled=False, must_change=must_change, created=time.time())
+    return rec
+
+
+def verify_pw(pw, rec):
+    return hmac.compare_digest(hash_pw(pw, rec["salt"]), rec["hash"])
+
+
+def gen_password():
+    return secrets.token_urlsafe(12)
+
+
+def valid_name(n):
+    return bool(NAME_RE.fullmatch(n))
+
+
+def users_load():
+    conf = read_json(CONF, {})
+    if "users" in conf and isinstance(conf["users"], dict):
+        return conf["users"]
+    if conf.get("hash") and conf.get("salt"):          # migrate v1 single-admin config
+        return {conf.get("user", "admin"): {"role": "admin", "salt": conf["salt"], "hash": conf["hash"],
+                                            "disabled": False, "must_change": False, "created": time.time()}}
+    return {}
+
+
+def users_save(users):
+    write_json(CONF, {"users": users})
+
+
+def active_admins(users):
+    return [n for n, r in users.items() if r.get("role") == "admin" and not r.get("disabled")]
 
 
 def read_secret():
@@ -126,13 +199,20 @@ def read_secret():
     return sys.stdin.read().rstrip("\n")
 
 
-def cli_set_password(user):
+def cli_set_password(name):
+    name = name.strip().lower()
+    if not valid_name(name):
+        sys.exit("Invalid username (3-32 chars: a-z, 0-9, _ . -)")
     pw = read_secret()
     if len(pw) < 10:
         sys.exit("Password must be at least 10 characters")
-    salt = secrets.token_hex(16)
-    write_json(CONF, {"user": user, "salt": salt, "hash": hash_pw(pw, salt)})
-    print("Password saved for user '%s'" % user)
+    users = users_load()
+    if name in users:
+        users[name].update(new_pw_fields(pw), must_change=False, disabled=False)
+    else:
+        users[name] = new_record(pw, "admin")
+    users_save(users)
+    print("Password saved for '%s' (role: %s)" % (name, users[name].get("role")))
 
 
 def stats():
@@ -158,6 +238,10 @@ def bdir(bid):
     return os.path.join(BOTS, bid)
 
 
+def workdir(bid):
+    return os.path.join(BOTS, bid, "work")
+
+
 def meta_load(bid):
     return read_json(os.path.join(bdir(bid), "meta.json"), {})
 
@@ -176,45 +260,85 @@ def meta_update(bid, **kw):
         return m
 
 
-def list_bots():
+def list_bots(owner=None):
     out = []
     if os.path.isdir(BOTS):
         for bid in os.listdir(BOTS):
             m = meta_load(bid)
-            if m.get("id") == bid:
+            if m.get("id") == bid and (owner is None or m.get("owner") == owner):
                 out.append(m)
     return sorted(out, key=lambda x: x.get("created", 0), reverse=True)
 
 
-# ---------- import scanning ----------
-def scan_py(src):
-    try:
-        tree = ast.parse(src)
-    except SyntaxError as e:
-        raise ValueError("Syntax error at line %s: %s" % (e.lineno, e.msg))
-    mods = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                mods.add(a.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            mods.add(node.module.split(".")[0])
-    std = sys.stdlib_module_names
-    return sorted({PY_MAP.get(m, m) for m in mods if m not in std and not m.startswith("_")})
+def can_access(s, m):
+    return s["role"] == "admin" or m.get("owner") == s["user"]
 
 
-def scan_js(src):
-    specs = set()
-    for rx in JS_RE:
-        specs.update(rx.findall(src))
-    pk = set()
-    for s in specs:
-        if s.startswith((".", "/", "node:")) or s in NODE_BUILTIN:
+def harden(bid):
+    """Root owns everything in the bot folder; only work/ is writable by the bot user."""
+    d = bdir(bid)
+    os.chmod(d, 0o755)
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        if os.path.islink(p) or os.path.isdir(p):
             continue
-        p = "/".join(s.split("/")[:2]) if s.startswith("@") else s.split("/")[0]
-        if p and not p.startswith("-"):
-            pk.add(p)
-    return sorted(pk)
+        secret = name == "meta.json" or name.startswith("bot.log") or name == "meta.json.tmp"
+        os.chmod(p, 0o600 if secret else 0o644)
+
+
+def prep_workdir(bid):
+    w = workdir(bid)
+    os.makedirs(w, mode=0o700, exist_ok=True)
+    if BOT_RUN_AS and os.geteuid() == 0:
+        pw = pwd.getpwnam(BOT_RUN_AS)
+        os.chown(w, pw.pw_uid, pw.pw_gid)
+    os.chmod(w, 0o700)
+
+
+# ---------- code scanner ----------
+def analyze(kind, src):
+    """Returns (violations, imports). Raises ValueError on Python syntax errors."""
+    viol = []
+    for n, line in enumerate(src.splitlines(), 1):
+        for cat, rx in RULES_C:
+            if rx.search(line):
+                viol.append("line %d [%s] %s" % (n, cat, line.strip()[:70]))
+                break
+    if kind == "py":
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as e:
+            raise ValueError("Syntax error at line %s: %s" % (e.lineno, e.msg))
+        mods = set()
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            for nm in names:
+                top = nm.split(".")[0]
+                mods.add(top)
+                if top in BANNED_PY_MODULES:
+                    viol.append("line %d [hosting] import '%s' is not allowed" % (node.lineno, nm))
+        std = sys.stdlib_module_names
+        imports = sorted({PY_MAP.get(m, m) for m in mods if m not in std and not m.startswith("_")})
+    else:
+        specs = set()
+        for rx in JS_RE:
+            specs.update(rx.findall(src))
+        for s in specs:
+            if s in BANNED_JS_MODULES:
+                viol.append("[hosting] require('%s') is not allowed" % s)
+        pk = set()
+        for s in specs:
+            if s.startswith((".", "/", "node:")) or s in NODE_BUILTIN:
+                continue
+            p = "/".join(s.split("/")[:2]) if s.startswith("@") else s.split("/")[0]
+            if p and not p.startswith("-"):
+                pk.add(p)
+        imports = sorted(pk)
+    return viol, imports
 
 
 # ---------- installers ----------
@@ -256,6 +380,10 @@ def install_py(d, pkgs, say):
     if not py:
         return False, err
     cons = os.path.join(d, "constraints.txt")
+    try:
+        os.unlink(cons)
+    except FileNotFoundError:
+        pass
     with open(cons, "w") as f:
         f.write(CONSTRAINTS)
     if not pkgs:
@@ -275,12 +403,12 @@ def install_js(d, pkgs, say):
             return False, "Node.js install failed: " + out
     pj = os.path.join(d, "package.json")
     if not os.path.exists(pj):
-        with open(pj, "w") as f:
-            json.dump({"name": "tbp-bot", "private": True}, f)
+        write_json(pj, {"name": "tbp-bot", "private": True})
     if not pkgs:
         return True, ""
     say("Installing JavaScript packages...")
-    rc, out = run_cmd(["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"] + pkgs, cwd=d, timeout=1200)
+    rc, out = run_cmd(["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts", "--loglevel=error"] + pkgs,
+                      cwd=d, timeout=1200)
     return (rc == 0), ("" if rc == 0 else out[-500:])
 
 
@@ -292,10 +420,14 @@ def install_worker(bid, autostart):
             return
         d = bdir(bid)
         src = read_text(os.path.join(d, m["file"]))
-        detected = scan_py(src) if m["kind"] == "py" else scan_js(src)
+        viol, detected = analyze(m["kind"], src)
+        if viol:
+            meta_update(bid, status="error", msg="Blocked by code scanner: " + viol[0][:150],
+                        violations=viol[:20], installed=[], blocked=[])
+            return
         wanted = sorted(set(detected) | set(m.get("extra", [])))
         good, bad = split_blocked(wanted)
-        meta_update(bid, msg="Scanning imports...", deps=wanted, blocked=bad)
+        meta_update(bid, msg="Scanning imports...", deps=wanted, blocked=bad, violations=[])
 
         def say(t):
             meta_update(bid, msg=t)
@@ -310,6 +442,7 @@ def install_worker(bid, autostart):
             ready = True
         else:
             meta_update(bid, status="error", msg=err or "Install failed", installed=[])
+        harden(bid)
     except ValueError as e:
         meta_update(bid, status="error", msg=str(e)[:300], installed=[])
     except Exception as e:
@@ -322,6 +455,20 @@ def install_worker(bid, autostart):
 
 
 # ---------- process control ----------
+def ensure_bot_user():
+    if os.geteuid() != 0:
+        return None
+    try:
+        pwd.getpwnam(BOT_USER)
+    except KeyError:
+        run_cmd(["useradd", "-r", "-M", "-d", "/nonexistent", "-s", "/usr/sbin/nologin", BOT_USER], timeout=60)
+        try:
+            pwd.getpwnam(BOT_USER)
+        except KeyError:
+            return None
+    return BOT_USER
+
+
 def is_running(bid, m):
     p = PROCS.get(bid)
     if p is not None:
@@ -332,9 +479,10 @@ def is_running(bid, m):
     if not pid:
         return False
     try:
-        return os.readlink("/proc/%d/cwd" % pid) == os.path.realpath(bdir(bid))
+        cwd = os.path.realpath(os.readlink("/proc/%d/cwd" % pid))
     except OSError:
         return False
+    return cwd in (os.path.realpath(bdir(bid)), os.path.realpath(workdir(bid)))
 
 
 def alive(pid):
@@ -354,24 +502,32 @@ def start_bot(bid, manual=True):
             return False, m.get("msg") or "Not ready yet"
         if is_running(bid, m):
             return True, "Already running"
+        as_root = os.geteuid() == 0
+        if as_root and not BOT_RUN_AS:
+            return False, "Sandbox user '%s' missing - bots will not run as root" % BOT_USER
         d = bdir(bid)
+        harden(bid)
+        prep_workdir(bid)
+        target = os.path.join(d, m["file"])
         if m["kind"] == "py":
-            cmd = [os.path.join(d, "venv", "bin", "python3"), m["file"]]
+            cmd = [os.path.join(d, "venv", "bin", "python3"), target]
         else:
-            cmd = [shutil.which("node") or "node", m["file"]]
+            cmd = [shutil.which("node") or "node", target]
         logp = os.path.join(d, "bot.log")
         try:
             if os.path.getsize(logp) > 5 * 1024 * 1024:
                 os.replace(logp, logp + ".1")
         except OSError:
             pass
-        env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": d, "LANG": "C.UTF-8",
-               "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": workdir(bid),
+               "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        kw = {"user": BOT_RUN_AS, "group": BOT_RUN_AS} if (as_root and BOT_RUN_AS) else {}
         try:
-            with open(logp, "ab") as lf:
+            fd = os.open(logp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "ab") as lf:
                 lf.write(("\n=== start %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
-                p = subprocess.Popen(cmd, cwd=d, env=env, stdin=subprocess.DEVNULL, stdout=lf,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
+                p = subprocess.Popen(cmd, cwd=workdir(bid), env=env, stdin=subprocess.DEVNULL, stdout=lf,
+                                     stderr=subprocess.STDOUT, start_new_session=True, **kw)
         except OSError as e:
             return False, "Could not start: %s" % str(e)[:200]
         PROCS[bid] = p
@@ -445,6 +601,12 @@ def watchdog():
         except Exception:
             traceback.print_exc()
         time.sleep(10)
+
+
+def kill_sessions(name):
+    with LOCK:
+        for t in [t for t, v in SESSIONS.items() if v.get("user") == name]:
+            SESSIONS.pop(t, None)
 
 
 def tail(path, n=100):
@@ -554,8 +716,8 @@ button:active,.btn:active{transform:scale(.97)}
 .btn.ok{background:rgba(52,211,153,.15);border-color:rgba(52,211,153,.45);color:#a7f3d0}
 .btn.dng{background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.45);color:#fecdd3}
 .btn.ghost{background:transparent}.btn.sm{padding:5px 11px;font-size:13px}.wide{width:100%}
-input[type=text],input[type=password]{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt)}
-input:focus{outline:2px solid rgba(34,211,238,.45);border-color:transparent}
+input[type=text],input[type=password],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt)}
+input:focus,select:focus{outline:2px solid rgba(34,211,238,.45);border-color:transparent}
 label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 .mini{display:inline-flex;gap:5px;align-items:center;font-weight:500;color:var(--mut);margin-left:4px}
 .drop{display:block;border:2px dashed rgba(167,139,250,.45);border-radius:16px;padding:22px;text-align:center;cursor:pointer;background:rgba(167,139,250,.05);margin-bottom:12px;color:var(--mut)}
@@ -566,6 +728,8 @@ label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 .flash{padding:11px 15px;border-radius:14px;border:1px solid;font-weight:600;margin:12px 0}
 .flash.ok{color:#a7f3d0;border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.1)}
 .flash.bad{color:#fecdd3;border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.1)}
+.reveal{border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);border-radius:16px;padding:14px;margin:12px 0}
+.reveal code{display:block;margin-top:8px;padding:10px;border-radius:10px;background:rgba(3,4,12,.85);font-size:16px;letter-spacing:.06em;word-break:break-all;color:#fde68a}
 pre.log{white-space:pre-wrap;word-break:break-word;background:rgba(3,4,12,.85);border:1px solid var(--line);border-radius:14px;padding:14px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;color:#cbd5e1;max-height:60vh;overflow:auto;margin:0}
 .log .err{color:#fda4af}.log .warn{color:#fde68a}.log .sep{color:var(--c1);font-weight:700}
 .empty{color:var(--mut);text-align:center;padding:24px}
@@ -590,9 +754,14 @@ def layout(s, title, body, active="", refresh=0):
     with LOCK:
         fl = s.pop("flash", None)
     flash = "<div class='flash %s'>%s</div>" % (fl[0], esc(fl[1])) if fl else ""
-    nav = "<a class='%s' href='/'>Dashboard</a>" % ("on" if active == "dash" else "")
+    links = [("dash", "/", "Dashboard")]
+    if s["role"] == "admin":
+        links.append(("users", "/users", "Users"))
+    links.append(("acct", "/account", "Account"))
+    nav = "".join("<a class='%s' href='%s'>%s</a>" % ("on" if k == active else "", h, t) for k, h, t in links)
     top = ("<header class=top><div class=brand><span class=logo>TBP</span><span class=tag>Userbot Panel</span></div>"
-           "<nav>" + nav + "<form method=post action=/logout><input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
+           "<nav>" + nav + "<span class=kv>" + esc(s["user"]) + " · " + esc(s["role"]) + "</span>"
+           "<form method=post action=/logout><input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
            "<button class='btn ghost sm'>Logout</button></form></nav></header>")
     foot = "<footer>TBP v%s</footer>" % VERSION
     return page(title, top + flash + body + foot, refresh)
@@ -607,13 +776,15 @@ def tile(label, value, p=None, sub=""):
             % (esc(label), esc(value), bar, esc(sub)))
 
 
-def bot_row(m):
+def bot_row(m, show_owner):
     label, cls = state_of(m)
     bid = m["id"]
+    owner = (" · owner " + esc(m.get("owner", ""))) if show_owner else ""
     return ("<div class=row><div><div class=name><a href='/bot/%s' style='color:inherit;text-decoration:none'>%s</a></div>"
-            "<div class=kv>%s · %s</div></div><div class=acts><span class='pill %s'>%s</span>"
+            "<div class=kv>%s%s · %s</div></div><div class=acts><span class='pill %s'>%s</span>"
             "<a class='btn sm' href='/bot/%s'>Open</a></div></div>"
-            % (bid, esc(m.get("name", "")), esc(m.get("kind", "").upper()), esc(m.get("msg", "")), cls, esc(label), bid))
+            % (bid, esc(m.get("name", "")), esc(m.get("kind", "").upper()), owner, esc(m.get("msg", "")),
+               cls, esc(label), bid))
 
 
 def upload_card(csrf):
@@ -625,6 +796,8 @@ def upload_card(csrf):
             "<button class='btn pri wide'>Upload &amp; install packages</button>"
             "<div class=kv style='margin-top:12px'>Never installed here: "
             "<span class='tag2 blk'>opencv-python</span><span class='tag2 blk'>numpy</span><span class='tag2 blk'>ddddocr</span></div>"
+            "<div class=kv style='margin-top:8px'>Rejected automatically: bot-hosting code, server control, "
+            "shell/reverse-shell, miners and obfuscated exec.</div>"
             "</form></div>")
 
 
@@ -632,6 +805,14 @@ def act_form(csrf, bid, act, label, cls, inner=""):
     return ("<form class=inline method=post action=/action>"
             "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
             "<input type=hidden name=id value='" + bid + "'>"
+            "<input type=hidden name=act value='" + act + "'>" + inner +
+            "<button class='btn " + cls + "'>" + esc(label) + "</button></form> ")
+
+
+def ufm(csrf, act, user, label, cls, inner=""):
+    return ("<form class=inline method=post action=/users/action>"
+            "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
+            "<input type=hidden name=user value='" + esc(user) + "'>"
             "<input type=hidden name=act value='" + act + "'>" + inner +
             "<button class='btn " + cls + "'>" + esc(label) + "</button></form> ")
 
@@ -692,10 +873,17 @@ class H(BaseHTTPRequestHandler):
             return None
         with LOCK:
             s = SESSIONS.get(m.value)
-            if s and s["exp"] > time.time():
-                return s
-            SESSIONS.pop(m.value, None)
-        return None
+            if not s or s["exp"] <= time.time():
+                SESSIONS.pop(m.value, None)
+                return None
+        rec = users_load().get(s["user"])
+        if not rec or rec.get("disabled"):
+            with LOCK:
+                SESSIONS.pop(m.value, None)
+            return None
+        s["role"] = rec.get("role", "user")
+        s["must_change"] = bool(rec.get("must_change"))
+        return s
 
     def _error(self):
         traceback.print_exc()
@@ -712,20 +900,27 @@ class H(BaseHTTPRequestHandler):
             self._error()
 
     def _get(self):
-        u = urlparse(self.path)
-        path = u.path
+        path = urlparse(self.path).path
         if path == "/login":
             return self.login_page()
         s = self.sess()
         if not s:
             return self.go("/login")
+        if s["must_change"] and path != "/account":
+            return self.go("/account")
         if path == "/":
             return self.dash(s)
+        if path == "/account":
+            return self.account_page(s)
+        if path == "/users":
+            if s["role"] != "admin":
+                return self.send_html(403, layout(s, "Forbidden", "<h1>Admins only</h1>", "dash"))
+            return self.users_page(s)
         mt = re.fullmatch(r"/bot/(" + BID_RE + r")(/log)?", path)
         if mt:
             bid = mt.group(1)
             m = meta_load(bid)
-            if not m or m.get("id") != bid:
+            if not m or m.get("id") != bid or not can_access(s, m):
                 return self.send_html(404, layout(s, "Not found", "<h1>Bot not found</h1>", "dash"))
             if mt.group(2):
                 return self.log_page(s, m, bid)
@@ -759,15 +954,21 @@ class H(BaseHTTPRequestHandler):
             return self.send_html(403, page("Forbidden", "<p class=center>Form expired. Reload the page and try again.</p>"))
         if path == "/logout":
             with LOCK:
-                SESSIONS.pop(s.get("tok"), None)
+                SESSIONS.pop(s["tok"], None)
             return self.go("/login", [("Set-Cookie", "sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")])
+        if s["must_change"] and path != "/account/password":
+            return self.go("/account")
         if path == "/upload":
             return self.do_upload(s, fields, files)
         if path == "/action":
             return self.do_action(s, fields)
+        if path == "/users/action":
+            return self.do_user_action(s, fields)
+        if path == "/account/password":
+            return self.do_password(s, fields)
         self.send_html(404, layout(s, "Not found", "<h1>Not found</h1>", "dash"))
 
-    # ----- pages -----
+    # ----- auth -----
     def login_page(self, err=""):
         e = "<div class='flash bad'>%s</div>" % esc(err) if err else ""
         body = ("<div class=auth><div class=authbox><div class=center><span class=logo>TBP</span></div>"
@@ -786,12 +987,16 @@ class H(BaseHTTPRequestHandler):
             until = FAILS.get(ip, [0, 0])[1]
         if until > now:
             return self.send_html(429, page("Locked", "<p class=center>Too many attempts. Wait a few minutes.</p>"))
-        conf = read_json(CONF, {})
-        if not conf.get("hash") or not conf.get("salt"):
-            return self.send_html(500, page("Error", "<p class=center>No password set. Run --set-password first.</p>"))
-        pw_ok = hmac.compare_digest(hash_pw(f.get("p", ""), conf["salt"]).encode(), conf["hash"].encode())
-        u_ok = hmac.compare_digest(f.get("u", "").encode(), conf.get("user", "").encode())
-        if not (pw_ok and u_ok):
+        name = f.get("u", "").strip().lower()
+        pw = f.get("p", "")
+        users = users_load()
+        rec = users.get(name)
+        if rec:
+            pw_ok = verify_pw(pw, rec)
+        else:
+            hash_pw(pw, "00" * 16)                      # equalize timing for unknown users
+            pw_ok = False
+        if not pw_ok or (rec and rec.get("disabled")):
             with LOCK:
                 c, until = FAILS.get(ip, [0, 0])
                 c += 1
@@ -806,25 +1011,34 @@ class H(BaseHTTPRequestHandler):
             FAILS.pop(ip, None)
             for k in [k for k, v in SESSIONS.items() if v["exp"] <= now]:
                 SESSIONS.pop(k, None)
-            SESSIONS[tok] = {"exp": now + SESSION_TTL, "csrf": csrf, "flash": None, "tok": tok}
+            SESSIONS[tok] = {"exp": now + SESSION_TTL, "csrf": csrf, "flash": None, "tok": tok,
+                             "user": name, "role": rec.get("role", "user"),
+                             "must_change": bool(rec.get("must_change")), "reveal": None}
         cookie = "sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s" % (
             tok, SESSION_TTL, "; Secure" if self.secure() else "")
-        sys.stderr.write("LOGIN OK from %s\n" % ip)
+        sys.stderr.write("LOGIN OK %s from %s\n" % (name, ip))
         self.go("/", [("Set-Cookie", cookie)])
 
+    # ----- pages -----
     def dash(self, s):
-        st = stats()
-        cores = st["cores"]
-        mp = pct(st["mem_used"], st["mem_total"])
-        dp = pct(st["disk_used"], st["disk_total"])
-        tiles = (tile("CPU load", "%.2f" % st["load1"], min(100, int(st["load1"] * 100 / cores)),
-                      "%d cores · %s" % (cores, " ".join(st["load"])))
-                 + tile("Memory", "%d%%" % mp, mp, "%s / %s" % (human(st["mem_used"]), human(st["mem_total"])))
-                 + tile("Disk /", "%d%%" % dp, dp, "%s / %s" % (human(st["disk_used"]), human(st["disk_total"])))
-                 + tile("Uptime", st["uptime"], None, st["host"]))
-        rows = "".join(bot_row(m) for m in list_bots()) or "<div class=empty>No bots yet. Upload one below ↓</div>"
-        body = ("<h1>Dashboard</h1><div class=mut>Server health &amp; your userbots</div>"
-                "<div class=grid>" + tiles + "</div><h2>Bots</h2><div class=card>" + rows + "</div>"
+        admin = s["role"] == "admin"
+        tiles = ""
+        if admin:
+            st = stats()
+            mp = pct(st["mem_used"], st["mem_total"])
+            dp = pct(st["disk_used"], st["disk_total"])
+            cores = st["cores"]
+            tiles = ("<div class=grid>"
+                     + tile("CPU load", "%.2f" % st["load1"], min(100, int(st["load1"] * 100 / cores)),
+                            "%d cores · %s" % (cores, " ".join(st["load"])))
+                     + tile("Memory", "%d%%" % mp, mp, "%s / %s" % (human(st["mem_used"]), human(st["mem_total"])))
+                     + tile("Disk /", "%d%%" % dp, dp, "%s / %s" % (human(st["disk_used"]), human(st["disk_total"])))
+                     + tile("Uptime", st["uptime"], None, st["host"]) + "</div>")
+        bots = list_bots() if admin else list_bots(owner=s["user"])
+        rows = "".join(bot_row(m, admin) for m in bots) or "<div class=empty>No bots yet. Upload one below ↓</div>"
+        heading = "All bots" if admin else "Your bots"
+        body = ("<h1>Dashboard</h1><div class=mut>" + ("Server health &amp; all userbots" if admin else "Your userbots") + "</div>"
+                + tiles + "<h2>" + heading + "</h2><div class=card>" + rows + "</div>"
                 "<h2>Upload a bot</h2>" + upload_card(s["csrf"]))
         self.send_html(200, layout(s, "TBP · Dashboard", body, "dash"))
 
@@ -833,7 +1047,6 @@ class H(BaseHTTPRequestHandler):
         label, cls = state_of(m)
         running = label == "Running"
         installing = m.get("status") == "installing"
-
         btns = ""
         if m.get("status") == "ready":
             if running:
@@ -844,11 +1057,14 @@ class H(BaseHTTPRequestHandler):
         btns += act_form(csrf, bid, "reinstall", "Reinstall packages", "sm")
         btns += act_form(csrf, bid, "delete", "Delete", "sm dng",
                          "<label class=mini><input type=checkbox name=confirm value=yes required> confirm</label>")
-
         spin = "<span class=spin>◌</span> " if installing else ""
         pills = "".join("<span class=tag2>%s</span>" % esc(p) for p in m.get("installed", [])) or "<span class=mut>none</span>"
         blk = "".join("<span class='tag2 blk'>%s</span>" % esc(p) for p in m.get("blocked", []))
         blk_note = ("<div class=kv style='margin-top:10px'>Skipped by policy (never installed):</div>" + blk) if blk else ""
+        viol = m.get("violations") or []
+        viol_html = ""
+        if viol:
+            viol_html = ("<h2>Scanner findings</h2><div class=card><pre class=log>" + esc("\n".join(viol)) + "</pre></div>")
         extra_form = ("<form method=post action=/action>"
                       "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
                       "<input type=hidden name=id value='" + bid + "'>"
@@ -859,13 +1075,15 @@ class H(BaseHTTPRequestHandler):
         logs = colorize(tail(os.path.join(bdir(bid), "bot.log"), 40))
         refresh = 3 if installing else 0
         body = ("<h1>" + esc(m.get("name", "")) + "</h1>"
-                "<div class=mut>" + esc(m.get("kind", "").upper()) + " bot · id " + bid + "</div>"
+                "<div class=mut>" + esc(m.get("kind", "").upper()) + " bot · owner <b>" + esc(m.get("owner", "")) +
+                "</b> · id " + bid + "</div>"
                 "<h2>Status</h2><div class=card>"
                 "<div class=row><div>" + spin + "<span class='pill " + cls + "'>" + esc(label) + "</span></div>"
                 "<div class=kv>PID <b>" + esc(m.get("pid") or "-") + "</b></div></div>"
                 "<div class=kv style='margin-top:8px'>" + esc(m.get("msg", "")) + "</div>"
                 "<div class=acts style='margin-top:12px'>" + btns + "</div></div>"
                 "<h2>Packages</h2><div class=card>" + pills + blk_note + "</div>"
+                + viol_html +
                 "<h2>Extra packages</h2><div class=card>" + extra_form + "</div>"
                 "<h2>Logs</h2><div class=acts style='margin-bottom:8px'>"
                 "<a class=btn href='/bot/" + bid + "/log'>Full log</a><a class=btn href='/bot/" + bid + "'>Refresh</a></div>"
@@ -882,6 +1100,65 @@ class H(BaseHTTPRequestHandler):
                 "<pre class=log>" + colorize(tail(os.path.join(bdir(bid), "bot.log"), 300)) + "</pre>")
         self.send_html(200, layout(s, "TBP · Logs", body, "dash", refresh))
 
+    def account_page(self, s):
+        warn = ("<div class='flash bad'>Your password was reset by an admin. Set a new password to continue.</div>"
+                if s["must_change"] else "")
+        body = ("<h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · " + esc(s["role"]) + "</div>"
+                + warn +
+                "<h2>Change password</h2><div class=card><form method=post action=/account/password>"
+                "<input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
+                "<label>Current password</label><input type=password name=old autocomplete=current-password required>"
+                "<label>New password (min 10 characters)</label><input type=password name=new autocomplete=new-password required>"
+                "<label>Repeat new password</label><input type=password name=new2 autocomplete=new-password required>"
+                "<button class='btn pri wide'>Update password</button></form></div>")
+        self.send_html(200, layout(s, "TBP · Account", body, "acct"))
+
+    def users_page(self, s):
+        users = users_load()
+        bots = list_bots()
+        counts = {}
+        for m in bots:
+            counts[m.get("owner")] = counts.get(m.get("owner"), 0) + 1
+        with LOCK:
+            rv = s.get("reveal")
+            s["reveal"] = None
+        csrf = s["csrf"]
+        reveal = ""
+        if rv:
+            reveal = ("<div class=reveal><b>Password for " + esc(rv[0]) + "</b> "
+                      "<span class=mut>— copy it now, it will not be shown again</span><code>" + esc(rv[1]) + "</code></div>")
+        rows = ""
+        for name in sorted(users):
+            r = users[name]
+            me = name == s["user"]
+            is_admin = r.get("role") == "admin"
+            disabled = bool(r.get("disabled"))
+            badge = "<span class='pill info'>admin</span>" if is_admin else "<span class='pill mut'>user</span>"
+            status = "<span class='pill bad'>disabled</span>" if disabled else "<span class='pill ok'>active</span>"
+            flag = " <span class=tag2>must change password</span>" if r.get("must_change") else ""
+            if me:
+                acts = "<span class=kv>(you — use Account page)</span>"
+            else:
+                acts = ufm(csrf, "reset", name, "Reset password", "sm")
+                acts += ufm(csrf, "toggle", name, "Enable" if disabled else "Disable", "sm" if disabled else "sm dng")
+                acts += ufm(csrf, "role", name, "Make user" if is_admin else "Make admin", "sm")
+                acts += ufm(csrf, "delete", name, "Delete", "sm dng",
+                            "<label class=mini><input type=checkbox name=confirm value=yes required> confirm</label>")
+            rows += ("<div class=row><div><div class=name>" + esc(name) + " " + badge + flag + "</div>"
+                     "<div class=kv>bots: <b>" + str(counts.get(name, 0)) + "</b> · created " + fmt_time(r.get("created")) +
+                     "</div></div><div class=acts>" + status + " " + acts + "</div></div>")
+        create = ("<div class=card><form method=post action=/users/action>"
+                  "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
+                  "<input type=hidden name=act value='create'>"
+                  "<label>Username (a-z, 0-9, _ . - · 3-32 chars)</label>"
+                  "<input type=text name=user autocomplete=off required>"
+                  "<label>Role</label><select name=role><option value=user>User</option><option value=admin>Admin</option></select>"
+                  "<button class='btn pri wide'>Create account &amp; generate password</button></form></div>")
+        body = ("<h1>Users</h1><div class=mut>Create accounts, reset passwords, disable or delete users</div>"
+                + reveal + "<h2>Accounts</h2><div class=card>" + rows + "</div>"
+                "<h2>New account</h2>" + create)
+        self.send_html(200, layout(s, "TBP · Users", body, "users"))
+
     # ----- actions -----
     def do_upload(self, s, f, files):
         up = files.get("file")
@@ -894,26 +1171,32 @@ class H(BaseHTTPRequestHandler):
         ext = os.path.splitext(base)[1].lower()
         if ext not in (".py", ".js"):
             return self.flash_go(s, "bad", "Only .py or .js files are allowed", "/")
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError:
-            return self.flash_go(s, "bad", "File must be UTF-8 text", "/")
         if b"\x00" in data:
             return self.flash_go(s, "bad", "Not a text file", "/")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return self.flash_go(s, "bad", "File must be UTF-8 text", "/")
+        kind = "py" if ext == ".py" else "js"
+        try:
+            viol, _ = analyze(kind, text)
+        except ValueError as e:
+            return self.flash_go(s, "bad", str(e), "/")
+        if viol:
+            return self.flash_go(s, "bad", "Blocked by code scanner: " + viol[0][:150], "/")
 
         bid = secrets.token_hex(6)
-        kind = "py" if ext == ".py" else "js"
         fname_on_disk = "bot" + ext
         d = bdir(bid)
-        os.makedirs(d, mode=0o700)
+        os.makedirs(d, mode=0o755)
         with open(os.path.join(d, fname_on_disk), "wb") as fh:
             fh.write(data)
-        os.chmod(os.path.join(d, fname_on_disk), 0o600)
         m = {"id": bid, "name": base, "file": fname_on_disk, "kind": kind, "status": "installing",
-             "msg": "Queued", "installed": [], "blocked": [], "deps": [], "extra": [], "pid": None,
-             "enabled": False, "restarts": 0, "created": time.time()}
+             "msg": "Queued", "installed": [], "blocked": [], "deps": [], "extra": [], "violations": [],
+             "owner": s["user"], "pid": None, "enabled": False, "restarts": 0, "created": time.time()}
         with LOCK:
             meta_save(bid, m)
+        harden(bid)
         autostart = bool(f.get("autostart"))
         threading.Thread(target=install_worker, args=(bid, autostart), daemon=True).start()
         self.go("/bot/" + bid)
@@ -923,10 +1206,9 @@ class H(BaseHTTPRequestHandler):
         if not re.fullmatch(BID_RE, bid):
             return self.flash_go(s, "bad", "Bad bot id", "/")
         m = meta_load(bid)
-        if not m or m.get("id") != bid:
+        if not m or m.get("id") != bid or not can_access(s, m):
             return self.flash_go(s, "bad", "Bot not found", "/")
         back = "/bot/" + bid
-
         if act == "start":
             ok, msg = start_bot(bid)
             return self.flash_go(s, "ok" if ok else "bad", msg, back)
@@ -950,7 +1232,7 @@ class H(BaseHTTPRequestHandler):
                 extra = m.get("extra", [])
             was_on = bool(m.get("enabled"))
             stop_bot(bid)
-            meta_update(bid, extra=extra, status="installing", msg="Queued", installed=[], blocked=[])
+            meta_update(bid, extra=extra, status="installing", msg="Queued", installed=[], blocked=[], violations=[])
             threading.Thread(target=install_worker, args=(bid, was_on), daemon=True).start()
             return self.flash_go(s, "ok", "Installing packages - this can take a few minutes", back)
         if act == "delete":
@@ -961,22 +1243,123 @@ class H(BaseHTTPRequestHandler):
             return self.flash_go(s, "ok", "Bot deleted", "/")
         return self.flash_go(s, "bad", "Unknown action", back)
 
+    def do_user_action(self, s, f):
+        if s["role"] != "admin":
+            return self.flash_go(s, "bad", "Admins only", "/")
+        act = f.get("act", "")
+        name = f.get("user", "").strip().lower()
+        users = users_load()
+        back = "/users"
+
+        if act == "create":
+            role = f.get("role", "user")
+            if not valid_name(name):
+                return self.flash_go(s, "bad", "Invalid username (3-32 chars: a-z, 0-9, _ . -)", back)
+            if name in users:
+                return self.flash_go(s, "bad", "Username already exists", back)
+            if role not in ("user", "admin"):
+                role = "user"
+            pw = gen_password()
+            users[name] = new_record(pw, role, must_change=True)
+            users_save(users)
+            with LOCK:
+                s["reveal"] = (name, pw)
+            return self.flash_go(s, "ok", "Account created - password shown below (once)", back)
+
+        if name not in users:
+            return self.flash_go(s, "bad", "User not found", back)
+        if name == s["user"]:
+            return self.flash_go(s, "bad", "Use the Account page for your own password and settings", back)
+        rec = users[name]
+        admins_on = active_admins(users)
+        is_last_admin = rec.get("role") == "admin" and name in admins_on and len(admins_on) == 1
+
+        if act == "reset":
+            pw = gen_password()
+            rec.update(new_pw_fields(pw), must_change=True)
+            users_save(users)
+            kill_sessions(name)
+            with LOCK:
+                s["reveal"] = (name, pw)
+            return self.flash_go(s, "ok", "Password reset - give it to the user (shown once)", back)
+
+        if act == "toggle":
+            if not rec.get("disabled") and is_last_admin:
+                return self.flash_go(s, "bad", "Cannot disable the last active admin", back)
+            rec["disabled"] = not rec.get("disabled")
+            users_save(users)
+            if rec["disabled"]:
+                kill_sessions(name)
+            return self.flash_go(s, "ok", ("Disabled " if rec["disabled"] else "Enabled ") + name, back)
+
+        if act == "role":
+            new_role = "user" if rec.get("role") == "admin" else "admin"
+            if new_role == "user" and is_last_admin:
+                return self.flash_go(s, "bad", "Cannot demote the last active admin", back)
+            rec["role"] = new_role
+            users_save(users)
+            return self.flash_go(s, "ok", name + " is now " + new_role, back)
+
+        if act == "delete":
+            if f.get("confirm") != "yes":
+                return self.flash_go(s, "bad", "Tick 'confirm' to delete", back)
+            if is_last_admin:
+                return self.flash_go(s, "bad", "Cannot delete the last active admin", back)
+            for m in list_bots(owner=name):
+                stop_bot(m["id"])
+                shutil.rmtree(bdir(m["id"]), ignore_errors=True)
+            users.pop(name, None)
+            users_save(users)
+            kill_sessions(name)
+            return self.flash_go(s, "ok", "Account and its bots deleted", back)
+
+        return self.flash_go(s, "bad", "Unknown action", back)
+
+    def do_password(self, s, f):
+        users = users_load()
+        rec = users.get(s["user"])
+        if not rec or not verify_pw(f.get("old", ""), rec):
+            return self.flash_go(s, "bad", "Current password is wrong", "/account")
+        new, new2 = f.get("new", ""), f.get("new2", "")
+        if len(new) < 10:
+            return self.flash_go(s, "bad", "New password must be at least 10 characters", "/account")
+        if new != new2:
+            return self.flash_go(s, "bad", "New passwords do not match", "/account")
+        rec.update(new_pw_fields(new), must_change=False)
+        users_save(users)
+        self.flash_go(s, "ok", "Password changed", "/")
+
 
 def main():
+    global BOT_RUN_AS
     if sys.version_info < (3, 10):
         sys.exit("TBP needs Python 3.10 or newer")
     a = sys.argv
     if len(a) == 3 and a[1] == "--set-password":
-        os.makedirs(HOME, mode=0o700, exist_ok=True)
         return cli_set_password(a[2])
-    os.makedirs(BOTS, mode=0o700, exist_ok=True)
-    if not read_json(CONF, {}).get("hash"):
-        sys.exit("No password yet. Run: sudo python3 app.py --set-password admin")
+    os.makedirs(BOTS, mode=0o711, exist_ok=True)
+    if os.geteuid() == 0:
+        os.chmod(HOME, 0o711)          # bot user must traverse to its own folder
+        os.chmod(BOTS, 0o711)
+    BOT_RUN_AS = ensure_bot_user()
+    users = users_load()
+    if not active_admins(users):
+        sys.exit("No active admin account. Run: sudo python3 app.py --set-password admin")
+    first_admin = sorted(active_admins(users))[0]
     for m in list_bots():
+        upd = {}
+        if not m.get("owner"):
+            upd["owner"] = first_admin
         if m.get("status") == "installing":
-            meta_update(m["id"], status="error", msg="Interrupted - click 'Reinstall packages'")
+            upd.update(status="error", msg="Interrupted - click 'Reinstall packages'")
+        if upd:
+            meta_update(m["id"], **upd)
+        if os.geteuid() == 0 and os.path.isdir(bdir(m["id"])):
+            harden(m["id"])
+    if os.geteuid() == 0 and not BOT_RUN_AS:
+        print("WARNING: could not create sandbox user '%s'; bots will not start" % BOT_USER, flush=True)
     threading.Thread(target=watchdog, daemon=True).start()
-    print("TBP panel running on http://127.0.0.1:%d" % PORT, flush=True)
+    print("TBP panel v%s running on http://127.0.0.1:%d" % (VERSION, PORT), flush=True)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     try:
         srv.serve_forever()
