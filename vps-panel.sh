@@ -4,9 +4,9 @@
 #  Supports: Ubuntu / Debian
 #
 #  Run with:
-#    bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/vps-panel.sh)
+#    bash <(curl -fsSL https://raw.githubusercontent.com/Turbospeed1963/vps-panel/main/vps-panel.sh)
 #  or:
-#    curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/vps-panel.sh -o vps-panel.sh && sudo bash vps-panel.sh
+#    curl -fsSL https://raw.githubusercontent.com/Turbospeed1963/vps-panel/main/vps-panel.sh -o vps-panel.sh && sudo bash vps-panel.sh
 # =====================================================
 
 set -u
@@ -582,7 +582,8 @@ TBP_CONF=$TBP_DIR/config.json
 TBP_SVC=tb-panel
 TBP_LOG=/var/log/tb-panel.log
 TBP_PORT=8787
-TBP_URL="https://raw.githubusercontent.com/USERNAME/REPO/main/app.py"   # <- แก้ตรงนี้
+# Override with: TBP_URL=... sudo -E bash vps-panel.sh
+TBP_URL="${TBP_URL:-https://raw.githubusercontent.com/Turbospeed1963/vps-panel/main/app.py}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
 
 tbp_installed() { [[ -f $TBP_APP ]]; }
@@ -613,7 +614,9 @@ tbp_fetch_app() {
   if [[ -n $SCRIPT_DIR && -f $SCRIPT_DIR/app.py ]]; then
     cp "$SCRIPT_DIR/app.py" "$tmp"; info "Using app.py next to this script"
   elif ! curl -fsSL --max-time 30 "$TBP_URL" -o "$tmp"; then
-    err "Could not download app.py from GitHub (check TBP_URL)"; rm -f "$tmp"; return 1
+    err "Could not download app.py from GitHub"
+    info "URL: $TBP_URL"
+    rm -f "$tmp"; return 1
   fi
   if ! grep -q 'Userbot Web Panel' "$tmp" || \
      ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$tmp" 2>/dev/null; then
