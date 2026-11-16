@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =====================================================
-#  TBP - VPS management menu + Web Panel (app.py v2.1)
+#  TURBO CHANNEL - VPS management menu + Web Panel (app.py V 2.2)
+#  Developer: TURBO   ·   Telegram: https://t.me/arsar2027
 #  Supports: Ubuntu / Debian
 #
 #  Run with:
@@ -11,7 +12,7 @@
 
 set -u
 
-TBP_VERSION="3.1"
+TBP_VERSION="3.2"
 
 # ---------- Theme ----------
 if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
@@ -101,9 +102,9 @@ banner() {
       if [[ -n $NC ]]; then printf '  \033[38;5;%sm%s\033[0m\n' "${shades[i]}" "${l[i]}"; else printf '  %s\n' "${l[i]}"; fi
     done
   else
-    echo -e "  ${CYAN}${BOLD}⚡ T B P ⚡${NC}"
+    echo -e "  ${CYAN}${BOLD}⚡ T U R B O ⚡${NC}"
   fi
-  echo -e "  ${GREY}VPS PANEL · v${TBP_VERSION} · Web Panel + Cloudflare Tunnel${NC}"
+  echo -e "  ${GREY}TURBO CHANNEL · VPS PANEL · v${TBP_VERSION} · Dev: TURBO · t.me/arsar2027${NC}"
 }
 
 PUBIP=""
@@ -389,12 +390,14 @@ do_reboot() {
 }
 
 # ---------- 13. Cloudflare Tunnel ----------
-CF_DIR=/etc/cloudflared-panel
-CF_TOKEN_FILE=$CF_DIR/token
-CF_LOG=/var/log/cloudflared-panel.log
+TBP_SECRETS_DIR=/etc/tbp
+CF_ENV=$TBP_SECRETS_DIR/env          # TUNNEL_TOKEN lives ONLY here (chmod 600, root)
+CF_SVC=cloudflared-tbp
+CF_UNIT=/etc/systemd/system/${CF_SVC}.service
+CF_LOG=/var/log/cloudflared-tbp.log
+LEGACY_CF_DIR=/etc/cloudflared-panel
 
-# Run a command fully detached from this terminal: new session (setsid), ignores
-# hangup (nohup), no tty on stdin. It keeps running after you close the terminal.
+# Run a command fully detached from this terminal (keeps running after you close it).
 detach_run() {
   local log=$1; shift
   if command -v setsid >/dev/null 2>&1; then
@@ -404,14 +407,32 @@ detach_run() {
   fi
 }
 
-# systemd is missing in most containers (Railway, Docker, etc.)
+# systemd is missing in most containers (Railway, Docker, Jupyter, etc.)
 have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; }
 cf_installed() { command -v cloudflared >/dev/null 2>&1; }
-cf_running() { pgrep -x cloudflared >/dev/null 2>&1; }
+cf_running()   { pgrep -x cloudflared >/dev/null 2>&1; }
+
+# Read / write the token file without ever echoing it.
+cf_token_get() {
+  [[ -f $CF_ENV ]] || return 1
+  sed -n 's/^TUNNEL_TOKEN=//p' "$CF_ENV" | head -n1
+}
+
+cf_token_save() {
+  local t=$1
+  mkdir -p "$TBP_SECRETS_DIR"; chmod 700 "$TBP_SECRETS_DIR"
+  ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$t" > "$CF_ENV" )
+  chmod 600 "$CF_ENV"
+  rm -rf "$LEGACY_CF_DIR"          # remove the token file from older versions
+}
 
 cf_state() {
   if have_systemd; then
-    systemctl is-active cloudflared 2>/dev/null || true
+    if systemctl is-active --quiet "$CF_SVC" 2>/dev/null || systemctl is-active --quiet cloudflared 2>/dev/null; then
+      echo active
+    else
+      echo inactive
+    fi
   elif cf_running; then
     echo active
   else
@@ -435,16 +456,49 @@ cf_install() {
   if cf_installed; then return 0; else err "Install failed"; return 1; fi
 }
 
-# Run cloudflared as a background process (no systemd). Token is passed via
-# environment variable so it does not show up in the process list.
+# Remove the old `cloudflared service install <token>` setup (its token sat in a unit file).
+cf_drop_legacy() {
+  if have_systemd && systemctl list-unit-files 2>/dev/null | grep -q '^cloudflared.service'; then
+    systemctl disable --now cloudflared >/dev/null 2>&1
+    cloudflared service uninstall >/dev/null 2>&1
+  fi
+  if [[ -e /etc/init.d/cloudflared ]]; then
+    cloudflared service uninstall >/dev/null 2>&1
+    rm -f /etc/init.d/cloudflared
+  fi
+}
+
+cf_write_unit() {
+  cat > "$CF_UNIT" <<EOF
+[Unit]
+Description=TURBO CHANNEL Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=$CF_ENV
+ExecStart=$(command -v cloudflared) tunnel --no-autoupdate run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$CF_UNIT"
+  systemctl daemon-reload
+}
+
+# Background mode (no systemd): token is read from the env file, passed as env var only.
 cf_start_bg() {
-  if [[ ! -s $CF_TOKEN_FILE ]]; then err "No saved token. Use option 1 first."; return 1; fi
-  command -v pgrep >/dev/null || { apt-get update -y >/dev/null 2>&1; apt-get install -y procps; }
+  local t
+  t=$(cf_token_get) || { err "No saved token. Use option 1 first."; return 1; }
+  [[ -n $t ]] || { err "Saved token is empty"; return 1; }
   pkill -x cloudflared 2>/dev/null; sleep 1
-  : > "$CF_LOG"
-  TUNNEL_TOKEN=$(cat "$CF_TOKEN_FILE") detach_run "$CF_LOG" cloudflared tunnel --no-autoupdate run
+  : > "$CF_LOG"; chmod 600 "$CF_LOG"
+  TUNNEL_TOKEN=$t detach_run "$CF_LOG" cloudflared tunnel --no-autoupdate run
+  unset t
   local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for i in $(seq 1 15); do
     sleep 1
     if cf_running && grep -q "Registered tunnel connection" "$CF_LOG" 2>/dev/null; then return 0; fi
   done
@@ -454,70 +508,73 @@ cf_start_bg() {
 cf_connect() {
   cf_install || return 1
   echo
-  echo -e "  ${BOLD}Cloudflare Zero Trust › Networks › Tunnels${NC} → copy your Tunnel token and paste it below."
-  echo -e "  ${GREY}(Token starts with eyJ... You can also paste the whole install command)${NC}"
-  echo -e "  ${GREY}Pasted text is hidden on screen.${NC}"
+  echo -e "  ${BOLD}Cloudflare Zero Trust › Networks › Tunnels${NC} → copy the token and paste it below."
+  echo -e "  ${GREY}Token starts with eyJ… (hidden on screen; saved to $CF_ENV with chmod 600)${NC}"
   read -rsp "  Token: " raw; echo
 
-  # If the whole command was pasted, extract only the token
   local token
   token=$(echo "$raw" | tr -d '[:space:]' | sed -E 's/.*(eyJ[A-Za-z0-9_=-]+)$/\1/')
-
+  unset raw
   if [[ ! $token =~ ^eyJ[A-Za-z0-9_=-]{40,}$ ]]; then
-    err "Invalid token format"
-    unset raw token
-    return 1
+    err "Invalid token format"; unset token; return 1
   fi
 
-  if have_systemd; then
-    if systemctl list-unit-files 2>/dev/null | grep -q '^cloudflared.service'; then
-      warn "Tunnel service already exists, replacing it..."
-      cloudflared service uninstall >/dev/null 2>&1
-    fi
+  cf_drop_legacy
+  cf_token_save "$token"
 
-    if cloudflared service install "$token"; then
-      systemctl enable --now cloudflared >/dev/null 2>&1
-      sleep 3
-      if systemctl is-active --quiet cloudflared; then
-        ok "Tunnel connected"
-        info "Set the Hostname/Service (e.g. http://localhost:8787) in the Cloudflare Dashboard."
-      else
-        err "Service is not running. Check logs (menu 13 → 4)"
-      fi
+  if have_systemd; then
+    cf_write_unit
+    systemctl enable --now "$CF_SVC" >/dev/null 2>&1
+    sleep 3
+    if systemctl is-active --quiet "$CF_SVC"; then
+      ok "Tunnel connected (systemd: $CF_SVC)"
     else
-      err "Tunnel service install failed"
+      err "Service not running. Check menu 13 → 4"
     fi
   else
-    warn "systemd not available (container). Running cloudflared as a background process."
-    if [[ -e /etc/init.d/cloudflared ]]; then
-      cloudflared service uninstall >/dev/null 2>&1
-      rm -f /etc/init.d/cloudflared
-    fi
-    mkdir -p "$CF_DIR"; chmod 700 "$CF_DIR"
-    ( umask 077; printf '%s' "$token" > "$CF_TOKEN_FILE" )
-    echo "  Connecting..."
+    warn "systemd not available (container). Running cloudflared in the background."
     if cf_start_bg; then
       ok "Tunnel connected (background process)"
-      info "It keeps running after you close this terminal."
-      info "Set the Hostname/Service in the Cloudflare Dashboard (Web Panel: localhost:8787)."
-      warn "In a container the tunnel stops when the container restarts. Re-run menu 13 → 1 or 3 then."
+      warn "In a container the tunnel stops when the container restarts - re-run menu 13 → 3."
     else
       err "Tunnel did not connect. Last log lines:"
       tail -n 12 "$CF_LOG" 2>/dev/null
     fi
   fi
-  unset raw token
+  unset token
+  info "Cloudflare Dashboard → Public Hostname → HTTP → localhost:${TBP_PORT}"
 }
 
 cf_status() {
   if have_systemd; then
-    systemctl status cloudflared --no-pager 2>&1 | head -n 20
+    systemctl status "$CF_SVC" --no-pager 2>&1 | head -n 15
   else
     echo "  State : $(cf_state)"
-    cf_running && echo "  PID   : $(pgrep -x cloudflared | head -n1)"
     echo "  --- last log lines ---"
     tail -n 8 "$CF_LOG" 2>/dev/null || echo "  (no log yet)"
   fi
+}
+
+cf_logs() {
+  if have_systemd; then
+    journalctl -u "$CF_SVC" -n 50 --no-pager 2>/dev/null
+  else
+    tail -n 50 "$CF_LOG" 2>/dev/null || echo "  (no log yet)"
+  fi
+}
+
+cf_remove() {
+  read -rp "  Remove tunnel? (yes/no): " a
+  [[ $a == yes ]] || return
+  if have_systemd; then
+    systemctl disable --now "$CF_SVC" >/dev/null 2>&1
+    rm -f "$CF_UNIT"
+    systemctl daemon-reload
+  fi
+  pkill -x cloudflared 2>/dev/null
+  cf_drop_legacy
+  rm -rf "$CF_ENV" "$LEGACY_CF_DIR" "$CF_LOG"
+  ok "Tunnel removed (token deleted)"
 }
 
 cf_menu() {
@@ -530,6 +587,7 @@ cf_menu() {
       if [[ $st == active ]]; then st="${GREEN}running${NC}"; else st="${RED}${st:-stopped}${NC}"; fi
       echo -e "  Status: $st   ${GREY}($(cloudflared --version 2>&1 | head -n1 | cut -c1-40))${NC}"
       have_systemd || echo -e "  Mode  : ${YELLOW}background process (no systemd)${NC}"
+      if [[ -s $CF_ENV ]]; then echo -e "  Token : ${GREEN}saved${NC} ${GREY}(${CF_ENV}, 600)${NC}"; else echo -e "  Token : ${YELLOW}not saved${NC}"; fi
     else
       echo -e "  Status: ${YELLOW}cloudflared not installed${NC}"
     fi
@@ -538,7 +596,7 @@ cf_menu() {
     opt 2 "Show status"
     opt 3 "Restart"
     opt 4 "Show logs (last 50 lines)"
-    opt 5 "Remove tunnel"
+    opt 5 "Remove tunnel (deletes token)"
     opt 6 "Update cloudflared"
     opt 0 "Back"
     echo
@@ -548,24 +606,14 @@ cf_menu() {
       2) cf_status; pause ;;
       3)
         if have_systemd; then
-          systemctl restart cloudflared && ok "Restarted"
+          systemctl restart "$CF_SVC" && ok "Restarted"
         else
           echo "  Restarting..."
           if cf_start_bg; then ok "Restarted, tunnel connected"; else err "Did not connect"; tail -n 8 "$CF_LOG" 2>/dev/null; fi
         fi
         pause ;;
-      4)
-        if have_systemd; then journalctl -u cloudflared -n 50 --no-pager; else tail -n 50 "$CF_LOG" 2>/dev/null || echo "  (no log yet)"; fi
-        pause ;;
-      5)
-        read -rp "  Remove tunnel? (yes/no): " a
-        if [[ $a == yes ]]; then
-          pkill -x cloudflared 2>/dev/null
-          cloudflared service uninstall >/dev/null 2>&1
-          rm -rf "$CF_DIR" "$CF_LOG"
-          ok "Tunnel removed"
-        fi
-        pause ;;
+      4) cf_logs; pause ;;
+      5) cf_remove; pause ;;
       6)
         spin_run "Updating cloudflared" bash -c 'apt-get update -y && apt-get install -y --only-upgrade cloudflared'
         info "Restart the tunnel to use the new version"; pause ;;
@@ -637,7 +685,7 @@ tbp_set_password() {
 tbp_write_unit() {
   cat > /etc/systemd/system/$TBP_SVC.service <<EOF
 [Unit]
-Description=TBP Userbot Web Panel
+Description=TURBO CHANNEL Userbot Web Panel
 After=network.target
 
 [Service]
@@ -668,7 +716,7 @@ tbp_start() {
   local i
   for i in 1 2 3 4 5 6; do
     sleep 1
-    if curl -s --max-time 3 "http://127.0.0.1:$TBP_PORT/login" | grep -q 'TBP'; then
+    if curl -s --max-time 3 "http://127.0.0.1:$TBP_PORT/login" | grep -q 'TURBO'; then
       ok "Web panel running on http://127.0.0.1:$TBP_PORT"
       return 0
     fi
@@ -728,7 +776,7 @@ tbp_install() {
   tbp_stop_old
   tbp_fetch_app || { pause; return; }
 
-  # v2.1 stores "key_hash" per user; a missing key means first-time setup
+  # v2.x stores "key_hash" per user; a missing key means first-time setup
   if [[ ! -s $TBP_CONF ]] || ! grep -q '"key_hash"' "$TBP_CONF"; then
     info "No admin key yet - creating one. SAVE the key shown below (it appears once)."
     tbp_set_password || { pause; return; }
@@ -756,6 +804,11 @@ tbp_uninstall() {
       "$TBP_DIR"/bots/*) kill "$p" 2>/dev/null ;;
     esac
   done
+  # remove per-bot OS users (tbpb_<id>)
+  local u
+  for u in $(getent passwd | cut -d: -f1 | grep '^tbpb_' || true); do
+    userdel "$u" >/dev/null 2>&1
+  done
   if have_systemd; then
     systemctl disable "$TBP_SVC" 2>/dev/null
     rm -f /etc/systemd/system/$TBP_SVC.service
@@ -768,7 +821,7 @@ tbp_uninstall() {
 wp_menu() {
   while true; do
     header
-    title "Web Panel (app.py) + Cloudflare"
+    title "TURBO CHANNEL · Web Panel (app.py)"
     if tbp_installed; then
       local st
       st=$(tbp_state)
@@ -845,12 +898,12 @@ main_menu() {
       12) do_reboot ;;
       13) cf_menu ;;
       14) wp_menu ;;
-      0) echo -e "\n  ${CYAN}⚡ Goodbye!${NC}\n"; exit 0 ;;
+      0) echo -e "\n  ${CYAN}⚡ TURBO CHANNEL · Goodbye!${NC}\n"; exit 0 ;;
       *) err "Invalid choice"; sleep 1 ;;
     esac
   done
 }
 
-printf "  ${GREY}Loading TBP…${NC}\r"
+printf "  ${GREY}Loading TURBO CHANNEL…${NC}\r"
 get_ip
 main_menu
