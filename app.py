@@ -1,31 +1,48 @@
 #!/usr/bin/env python3
 # =====================================================
-#  TBP - Userbot Web Panel v2.1  (single file, Python 3.10+ stdlib only)
-#  - Key login (no passwords): admin issues one access key per user, shown once
-#  - Users upload .py / .js bots; packages auto-installed per bot
-#  - Code scanner rejects bot-hosting, server-control and malware patterns
-#  - Bots run as unprivileged system user 'tbpbot' when panel runs as root
-#  - POLICY: opencv-python*, numpy, ddddocr are NEVER installed
+#  TURBO CHANNEL - Userbot Web Panel  ·  V 2.2
+#  Developer: TURBO   ·   Telegram: https://t.me/arsar2027
+#
+#  - Access-key login (no passwords). Admin issues keys, shown once.
+#  - Users see ONLY their own bots, logs and files. Admin sees everything.
+#  - Per-user quota: RAM 256 MB · CPU 0.5 core · Disk 1024 MB
+#      HARD via cgroup v2 (memory.max / cpu.max) when the host allows it,
+#      otherwise SOFT (RSS watchdog + disk checks + rlimits).
+#  - Every bot runs as its own unprivileged OS user (tbpb_<id>).
+#  - Code scanner blocks bot-hosting, server-control and malware code.
+#    3 violations = automatic account ban (admin can re-enable).
+#  - POLICY: opencv-python*, numpy, ddddocr are NEVER installed.
 #  Listens on 127.0.0.1 only. Publish via Cloudflare Tunnel.
-#  Admin key:  sudo python3 app.py --set-password admin   (same as --new-key admin)
+#  Admin key:  sudo python3 app.py --set-password admin
 #  Run:        sudo python3 app.py   ->  http://127.0.0.1:8787
 # =====================================================
-import ast, hashlib, hmac, html, json, os, pwd, re, secrets, shutil, signal, subprocess, sys, threading, time, traceback
+import ast, hashlib, hmac, html, json, os, pwd, re, resource, secrets, shutil, signal, subprocess, sys, threading, time, traceback
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.1"
+VERSION = "2.2"
+PANEL_NAME = "TURBO CHANNEL"
+DEVELOPER = "TURBO"
+TG_HANDLE = "@arsar2027"
+TG_URL = "https://t.me/arsar2027"
+
 HOME = os.environ.get("TBP_HOME", "/opt/tb-panel")
 CONF = os.path.join(HOME, "config.json")
 BOTS = os.path.join(HOME, "bots")
 PORT = int(os.environ.get("TBP_PORT", "8787"))
-BOT_USER = "tbpbot"
-BOT_RUN_AS = None              # set at startup when running as root
-MAX_UPLOAD = 2 * 1024 * 1024
+MB = 1024 * 1024
+QUOTA_RAM_MB = 256
+QUOTA_CPU = 0.5
+QUOTA_DISK_MB = 1024
+STRIKE_LIMIT = 3
+MAX_UPLOAD = 2 * MB
 SESSION_TTL = 8 * 3600
 MAX_FAILS, LOCK_SECS = 5, 300
 MAX_RESTARTS = 5
+CG_ROOT = "/sys/fs/cgroup"
+CG_BASE = os.path.join(CG_ROOT, "tbp")
+IS_ROOT = os.geteuid() == 0
 
 SESSIONS, FAILS, PROCS = {}, {}, {}
 LOCK = threading.RLock()
@@ -59,7 +76,7 @@ KEY_RE = re.compile(r"tbp_([0-9a-f]{8})\.([A-Za-z0-9_-]{40,64})")
 RULES = [
     ("hosting", r"\b(tb-panel|vps-panel|vps-webpanel|TBP_HOME|TBP_PORT|config\.json|meta\.json)\b|/opt/(tb-panel|vps-webpanel)"),
     ("hosting", r"\bbots/|\bbot\.log\b"),
-    ("hosting", r"\b(systemctl|journalctl|cloudflared|iptables|nginx|sshd|ufw)\b|/etc/(shadow|sudoers|passwd|ssh/)"),
+    ("hosting", r"\b(systemctl|journalctl|cloudflared|iptables|nginx|sshd|ufw)\b|/etc/(shadow|sudoers|passwd|ssh/|tbp/)"),
     ("hosting", r"\b(subprocess|os\.system|os\.popen|os\.spawn\w*|Popen|check_output|check_call|child_process|execSync|execFile|spawn|nohup|setsid)\b.*\b(python3?|node|npm|npx|bash|sh|nohup|setsid)\b"),
     ("malware", r"/dev/(tcp|udp)/|\bbash\s+-i\b|\b(nc|ncat|netcat|socat)\b.*\s-(e|c)\b|\bmkfifo\b"),
     ("malware", r"\brm\s+-rf\s+/(\s|$|\*)|\bmkfs(\.\w+)?\b|\bdd\s+if=|:\(\)\s*\{"),
@@ -71,20 +88,9 @@ RULES = [
 RULES_C = [(cat, re.compile(rx, re.I)) for cat, rx in RULES]
 
 
-# ---------- policy helpers ----------
-def blocked(name):
-    n = name.lower().replace("_", "-")
-    return n in BLOCK_EXACT or n.startswith(BLOCK_PREFIX)
-
-
-def split_blocked(names):
-    ok, bad = [], []
-    for n in names:
-        (bad if blocked(n) else ok).append(n)
-    return ok, bad
-
-
-# ---------- small helpers ----------
+# =====================================================
+#  Small helpers
+# =====================================================
 def esc(s):
     return html.escape(str(s), quote=True)
 
@@ -129,7 +135,7 @@ def write_json(p, obj):
     os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
     tmp = p + ".tmp"
     try:
-        os.unlink(tmp)                      # never write through a leftover symlink
+        os.unlink(tmp)
     except FileNotFoundError:
         pass
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -143,15 +149,29 @@ def read_text(p):
         return f.read()
 
 
-# ---------- access keys / accounts ----------
+def read_file(p, default=""):
+    try:
+        with open(p) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def _write(p, s):
+    with open(p, "w") as f:
+        f.write(s)
+
+
+# =====================================================
+#  Access keys / accounts
+# =====================================================
 def key_digest(secret):
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
 def issue_key(rec):
-    """Creates a new key for the account record (in place). Returns the full key once."""
-    kid = secrets.token_hex(4)               # public id, used for lookup
-    secret = secrets.token_urlsafe(32)       # private part, never stored
+    kid = secrets.token_hex(4)
+    secret = secrets.token_urlsafe(32)
     rec.pop("salt", None)
     rec.pop("hash", None)
     rec.update(key_id=kid, key_hash=key_digest(secret))
@@ -175,7 +195,7 @@ def has_key(rec):
 
 
 def new_record(role):
-    return {"role": role, "disabled": False, "created": time.time()}
+    return {"role": role, "disabled": False, "created": time.time(), "strikes": 0}
 
 
 def valid_name(n):
@@ -183,13 +203,14 @@ def valid_name(n):
 
 
 def users_load():
-    conf = read_json(CONF, {})
-    users = conf.get("users")
-    if isinstance(users, dict):
-        return users
-    if conf.get("user"):                      # migrate v1 single-admin config (no key yet)
-        return {conf["user"]: new_record("admin")}
-    return {}
+    with LOCK:
+        conf = read_json(CONF, {})
+        users = conf.get("users")
+        if isinstance(users, dict):
+            return users
+        if conf.get("user"):
+            return {conf["user"]: new_record("admin")}
+        return {}
 
 
 def users_save(users):
@@ -200,17 +221,42 @@ def active_admins(users):
     return [n for n, r in users.items() if r.get("role") == "admin" and not r.get("disabled") and has_key(r)]
 
 
+def owner_role(owner):
+    return users_load().get(owner, {}).get("role", "user")
+
+
+def add_strike(name):
+    with LOCK:
+        users = users_load()
+        rec = users.get(name)
+        if not rec:
+            return 0, False
+        rec["strikes"] = int(rec.get("strikes", 0)) + 1
+        banned = False
+        if rec["strikes"] >= STRIKE_LIMIT and rec.get("role") != "admin" and not rec.get("disabled"):
+            rec["disabled"] = True
+            banned = True
+        users_save(users)
+        strikes = rec["strikes"]
+    if banned:
+        for m in list_bots(owner=name):
+            stop_bot(m["id"])
+        kill_sessions(name)
+    return strikes, banned
+
+
 def cli_new_key(name):
     name = name.strip().lower()
     if not valid_name(name):
         sys.exit("Invalid username (3-32 chars: a-z, 0-9, _ . -)")
-    users = users_load()
-    if name not in users:
-        users[name] = new_record("admin")
-    rec = users[name]
-    rec["disabled"] = False
-    key = issue_key(rec)
-    users_save(users)
+    with LOCK:
+        users = users_load()
+        if name not in users:
+            users[name] = new_record("admin")
+        rec = users[name]
+        rec["disabled"] = False
+        key = issue_key(rec)
+        users_save(users)
     print("")
     print("Access key for '%s' (role: %s) - shown ONCE, save it now:" % (name, rec.get("role")))
     print(key)
@@ -235,7 +281,9 @@ def stats():
             "uptime": "%dd %dh %dm" % (d, h, rem // 60)}
 
 
-# ---------- bot storage ----------
+# =====================================================
+#  Bot storage
+# =====================================================
 def bdir(bid):
     return os.path.join(BOTS, bid)
 
@@ -276,28 +324,168 @@ def can_access(s, m):
     return s["role"] == "admin" or m.get("owner") == s["user"]
 
 
+# ---------- per-bot OS user ----------
+def bot_user(bid):
+    return "tbpb_" + bid
+
+
+def bot_pw(bid):
+    if not IS_ROOT:
+        return None
+    try:
+        return pwd.getpwnam(bot_user(bid))
+    except KeyError:
+        return None
+
+
+def ensure_bot_user(bid):
+    if not IS_ROOT:
+        return None
+    pw = bot_pw(bid)
+    if pw:
+        return pw
+    run_cmd(["useradd", "-r", "-M", "-d", "/nonexistent", "-s", "/usr/sbin/nologin", bot_user(bid)], timeout=60)
+    return bot_pw(bid)
+
+
+def drop_bot_user(bid):
+    if bot_pw(bid):
+        run_cmd(["userdel", bot_user(bid)], timeout=60)
+
+
+def _chown(p, uid, gid):
+    if IS_ROOT:
+        try:
+            os.chown(p, uid, gid)
+        except OSError:
+            pass
+
+
 def harden(bid):
-    """Root owns everything in the bot folder; only work/ is writable by the bot user."""
+    """Root owns the bot folder and secrets; the bot's own user can only read its
+    source and write its work/ folder. Other bots' users cannot enter this folder."""
     d = bdir(bid)
-    os.chmod(d, 0o755)
+    m = meta_load(bid)
+    pw = bot_pw(bid)
+    gid = pw.pw_gid if pw else 0
+    _chown(d, 0, gid)
+    os.chmod(d, 0o750 if pw else 0o755)
     for name in os.listdir(d):
         p = os.path.join(d, name)
-        if os.path.islink(p) or os.path.isdir(p):
+        if os.path.islink(p):
             continue
-        secret = name == "meta.json" or name.startswith("bot.log") or name == "meta.json.tmp"
-        os.chmod(p, 0o600 if secret else 0o644)
+        if name == "work":
+            if pw:
+                _chown(p, pw.pw_uid, pw.pw_gid)
+            os.chmod(p, 0o700)
+            continue
+        if os.path.isdir(p):
+            _chown(p, 0, 0)
+            os.chmod(p, 0o755)
+            continue
+        if name == m.get("file") or name in ("constraints.txt", "package.json"):
+            _chown(p, 0, gid)
+            os.chmod(p, 0o640 if pw else 0o644)
+        else:
+            _chown(p, 0, 0)
+            os.chmod(p, 0o600)
 
 
 def prep_workdir(bid):
     w = workdir(bid)
     os.makedirs(w, mode=0o700, exist_ok=True)
-    if BOT_RUN_AS and os.geteuid() == 0:
-        pw = pwd.getpwnam(BOT_RUN_AS)
-        os.chown(w, pw.pw_uid, pw.pw_gid)
+    pw = bot_pw(bid)
+    if pw:
+        _chown(w, pw.pw_uid, pw.pw_gid)
     os.chmod(w, 0o700)
 
 
-# ---------- code scanner ----------
+# =====================================================
+#  Quota: RAM 256 MB · CPU 0.5 core · Disk 1024 MB
+# =====================================================
+def dir_size(p):
+    total = 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def user_disk(owner):
+    return sum(dir_size(bdir(m["id"])) for m in list_bots(owner))
+
+
+def proc_rss(pid):
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def cg_dir(owner):
+    return os.path.join(CG_BASE, "u-" + hashlib.sha1(owner.encode()).hexdigest()[:12])
+
+
+def cg_ready_host():
+    return IS_ROOT and os.path.exists(os.path.join(CG_ROOT, "cgroup.controllers"))
+
+
+def cg_setup(owner):
+    """Creates a per-user cgroup v2 with memory.max=256M and cpu.max=0.5 core.
+    Returns the directory, or None when the host does not support it (soft mode)."""
+    if not cg_ready_host():
+        return None
+    try:
+        os.makedirs(CG_BASE, exist_ok=True)
+        _write(os.path.join(CG_ROOT, "cgroup.subtree_control"), "+cpu +memory")
+        _write(os.path.join(CG_BASE, "cgroup.subtree_control"), "+cpu +memory")
+        d = cg_dir(owner)
+        os.makedirs(d, exist_ok=True)
+        _write(os.path.join(d, "memory.max"), str(QUOTA_RAM_MB * MB))
+        _write(os.path.join(d, "memory.swap.max"), "0")
+        _write(os.path.join(d, "cpu.max"), "%d 100000" % int(QUOTA_CPU * 100000))
+        return d
+    except OSError:
+        return None
+
+
+def hard_mode(owner):
+    return os.path.exists(os.path.join(cg_dir(owner), "memory.max"))
+
+
+def owner_ram_used(owner):
+    cur = read_file(os.path.join(cg_dir(owner), "memory.current"), "").strip()
+    if cur.isdigit():
+        return int(cur)
+    total = 0
+    for m in list_bots(owner):
+        if m.get("pid") and is_running(m["id"], m):
+            total += proc_rss(m["pid"])
+    return total
+
+
+def quota_tiles(owner):
+    ram = owner_ram_used(owner)
+    disk = user_disk(owner)
+    mode = "HARD · cgroup v2" if hard_mode(owner) else "SOFT · watchdog"
+    return ("<div class=grid>"
+            + tile("RAM quota", "%s / %d MB" % (human(ram), QUOTA_RAM_MB), pct(ram, QUOTA_RAM_MB * MB), mode)
+            + tile("CPU quota", "%.1f core" % QUOTA_CPU, None, "%d%% of one core" % int(QUOTA_CPU * 100))
+            + tile("Disk quota", "%s / %d MB" % (human(disk), QUOTA_DISK_MB), pct(disk, QUOTA_DISK_MB * MB),
+                   "bots · venv · packages")
+            + "</div>")
+
+
+# =====================================================
+#  Code scanner
+# =====================================================
 def analyze(kind, src):
     """Returns (violations, imports). Raises ValueError on Python syntax errors."""
     viol = []
@@ -343,9 +531,23 @@ def analyze(kind, src):
     return viol, imports
 
 
-# ---------- installers ----------
+def blocked(name):
+    n = name.lower().replace("_", "-")
+    return n in BLOCK_EXACT or n.startswith(BLOCK_PREFIX)
+
+
+def split_blocked(names):
+    ok, bad = [], []
+    for n in names:
+        (bad if blocked(n) else ok).append(n)
+    return ok, bad
+
+
+# =====================================================
+#  Installers
+# =====================================================
 def apt_install(pkgs):
-    if os.geteuid() != 0:
+    if not IS_ROOT:
         return False, "Root is required to install: " + " ".join(pkgs)
     run_cmd(["apt-get", "update", "-y"], timeout=600)
     rc, out = run_cmd(["apt-get", "install", "-y"] + pkgs, timeout=900)
@@ -386,8 +588,7 @@ def install_py(d, pkgs, say):
         os.unlink(cons)
     except FileNotFoundError:
         pass
-    with open(cons, "w") as f:
-        f.write(CONSTRAINTS)
+    _write(cons, CONSTRAINTS)
     if not pkgs:
         return True, ""
     say("Installing Python packages...")
@@ -405,7 +606,7 @@ def install_js(d, pkgs, say):
             return False, "Node.js install failed: " + out
     pj = os.path.join(d, "package.json")
     if not os.path.exists(pj):
-        write_json(pj, {"name": "tbp-bot", "private": True})
+        write_json(pj, {"name": "turbo-bot", "private": True})
     if not pkgs:
         return True, ""
     say("Installing JavaScript packages...")
@@ -421,6 +622,8 @@ def install_worker(bid, autostart):
         if not m:
             return
         d = bdir(bid)
+        if IS_ROOT:
+            ensure_bot_user(bid)
         src = read_text(os.path.join(d, m["file"]))
         viol, detected = analyze(m["kind"], src)
         if viol:
@@ -438,13 +641,18 @@ def install_worker(bid, autostart):
             ok, err = install_py(d, good, say)
         else:
             ok, err = install_js(d, good, say)
-        if ok:
-            note = "Ready" + (" · skipped by policy: " + ", ".join(bad) if bad else "")
-            meta_update(bid, status="ready", msg=note, installed=good)
-            ready = True
-        else:
-            meta_update(bid, status="error", msg=err or "Install failed", installed=[])
         harden(bid)
+        if not ok:
+            meta_update(bid, status="error", msg=err or "Install failed", installed=[])
+            return
+        owner = m.get("owner", "")
+        if owner_role(owner) != "admin" and user_disk(owner) > QUOTA_DISK_MB * MB:
+            meta_update(bid, status="error", installed=[],
+                        msg="Disk quota exceeded (%d MB) - delete some bots first" % QUOTA_DISK_MB)
+            return
+        note = "Ready" + (" · skipped by policy: " + ", ".join(bad) if bad else "")
+        meta_update(bid, status="ready", msg=note, installed=good)
+        ready = True
     except ValueError as e:
         meta_update(bid, status="error", msg=str(e)[:300], installed=[])
     except Exception as e:
@@ -456,21 +664,9 @@ def install_worker(bid, autostart):
             meta_update(bid, msg=msg)
 
 
-# ---------- process control ----------
-def ensure_bot_user():
-    if os.geteuid() != 0:
-        return None
-    try:
-        pwd.getpwnam(BOT_USER)
-    except KeyError:
-        run_cmd(["useradd", "-r", "-M", "-d", "/nonexistent", "-s", "/usr/sbin/nologin", BOT_USER], timeout=60)
-        try:
-            pwd.getpwnam(BOT_USER)
-        except KeyError:
-            return None
-    return BOT_USER
-
-
+# =====================================================
+#  Process control
+# =====================================================
 def is_running(bid, m):
     p = PROCS.get(bid)
     if p is not None:
@@ -495,6 +691,19 @@ def alive(pid):
         return False
 
 
+def _child_limits():
+    def apply():
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            fsz = QUOTA_DISK_MB * MB
+            resource.setrlimit(resource.RLIMIT_FSIZE, (fsz, fsz))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+            resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
+        except (ValueError, OSError):
+            pass
+    return apply
+
+
 def start_bot(bid, manual=True):
     with LOCK:
         m = meta_load(bid)
@@ -504,12 +713,22 @@ def start_bot(bid, manual=True):
             return False, m.get("msg") or "Not ready yet"
         if is_running(bid, m):
             return True, "Already running"
-        as_root = os.geteuid() == 0
-        if as_root and not BOT_RUN_AS:
-            return False, "Sandbox user '%s' missing - bots will not run as root" % BOT_USER
-        d = bdir(bid)
+        owner = m.get("owner", "")
+        is_user = owner_role(owner) != "admin"
+        if is_user:
+            if user_disk(owner) > QUOTA_DISK_MB * MB:
+                return False, "Disk quota exceeded (%d MB)" % QUOTA_DISK_MB
+            if owner_ram_used(owner) >= QUOTA_RAM_MB * MB:
+                return False, "RAM quota reached (%d MB) - stop another bot first" % QUOTA_RAM_MB
+        pw = bot_pw(bid)
+        if IS_ROOT and not pw:
+            pw = ensure_bot_user(bid)
+            if not pw:
+                return False, "Could not create sandbox user for this bot"
+        cg = cg_setup(owner) if (IS_ROOT and is_user) else None
         harden(bid)
         prep_workdir(bid)
+        d = bdir(bid)
         target = os.path.join(d, m["file"])
         if m["kind"] == "py":
             cmd = [os.path.join(d, "venv", "bin", "python3"), target]
@@ -517,13 +736,15 @@ def start_bot(bid, manual=True):
             cmd = [shutil.which("node") or "node", target]
         logp = os.path.join(d, "bot.log")
         try:
-            if os.path.getsize(logp) > 5 * 1024 * 1024:
+            if os.path.getsize(logp) > 5 * MB:
                 os.replace(logp, logp + ".1")
         except OSError:
             pass
         env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": workdir(bid),
                "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-        kw = {"user": BOT_RUN_AS, "group": BOT_RUN_AS} if (as_root and BOT_RUN_AS) else {}
+        kw = {"preexec_fn": _child_limits()}
+        if pw:
+            kw.update(user=pw.pw_uid, group=pw.pw_gid, extra_groups=[])
         try:
             fd = os.open(logp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             with os.fdopen(fd, "ab") as lf:
@@ -532,6 +753,11 @@ def start_bot(bid, manual=True):
                                      stderr=subprocess.STDOUT, start_new_session=True, **kw)
         except OSError as e:
             return False, "Could not start: %s" % str(e)[:200]
+        if cg:
+            try:
+                _write(os.path.join(cg, "cgroup.procs"), str(p.pid))
+            except OSError:
+                pass
         PROCS[bid] = p
         m.update(pid=p.pid, started=time.time())
         if manual:
@@ -581,10 +807,29 @@ def state_of(m):
     return "Stopped", "mut"
 
 
+def enforce_quota():
+    """Soft RAM enforcement: if a user's bots exceed 256 MB together, stop the newest one."""
+    groups = {}
+    for m in list_bots():
+        o = m.get("owner", "")
+        if owner_role(o) != "admin":
+            groups.setdefault(o, []).append(m)
+    for owner, bots in groups.items():
+        if owner_ram_used(owner) <= QUOTA_RAM_MB * MB:
+            continue
+        running = [b for b in bots if is_running(b["id"], b)]
+        if not running:
+            continue
+        newest = max(running, key=lambda b: b.get("started", 0))
+        stop_bot(newest["id"])
+        meta_update(newest["id"], msg="RAM quota (%d MB) exceeded - stopped" % QUOTA_RAM_MB)
+
+
 def watchdog():
     time.sleep(3)
     while True:
         try:
+            enforce_quota()
             for m in list_bots():
                 bid = m["id"]
                 if m.get("status") != "ready" or not m.get("enabled"):
@@ -609,6 +854,13 @@ def kill_sessions(name, keep=None):
     with LOCK:
         for t in [t for t, v in SESSIONS.items() if v.get("user") == name and t != keep]:
             SESSIONS.pop(t, None)
+
+
+def tunnel_up():
+    try:
+        return subprocess.run(["pgrep", "-x", "cloudflared"], capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
 
 
 def tail(path, n=100):
@@ -639,7 +891,9 @@ def colorize(text):
     return "\n".join(out)
 
 
-# ---------- multipart / form parsing ----------
+# =====================================================
+#  Multipart / form parsing
+# =====================================================
 def parse_multipart(raw, boundary):
     fields, files = {}, {}
     delim = b"--" + boundary
@@ -675,32 +929,48 @@ def parse_body(raw, ctype):
     return fields, {}
 
 
-# ---------- UI ----------
+# =====================================================
+#  UI
+# =====================================================
 CSS = """
-:root{color-scheme:dark;--bg:#07070f;--card:rgba(20,22,40,.72);--line:rgba(120,130,200,.18);--txt:#eef0ff;--mut:#8b90b8;--c1:#22d3ee;--c2:#a78bfa;--c3:#f472b6;--ok:#34d399;--bad:#fb7185;--warn:#fbbf24;--info:#60a5fa}
+:root{color-scheme:dark;--bg:#05060d;--panel:rgba(18,20,38,.6);--panel2:rgba(26,29,54,.72);--line:rgba(140,150,230,.16);--txt:#eef0ff;--mut:#9097bf;--c1:#22d3ee;--c2:#a78bfa;--c3:#f472b6;--ok:#34d399;--bad:#fb7185;--warn:#fbbf24;--info:#60a5fa}
 *{box-sizing:border-box}html,body{margin:0}
-body{font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--txt);min-height:100vh;background:radial-gradient(900px 500px at 95% -10%,rgba(167,139,250,.28),transparent 60%),radial-gradient(800px 480px at -10% 0,rgba(34,211,238,.22),transparent 55%),radial-gradient(600px 400px at 50% 110%,rgba(244,114,182,.15),transparent 60%),var(--bg);background-attachment:fixed}
-main{max-width:900px;margin:0 auto;padding:16px 16px 48px}
-header.top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:8px}
-.brand{display:flex;align-items:baseline;gap:10px}
-.logo{font-weight:900;font-size:22px;letter-spacing:.2em;background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
-.tag{color:var(--mut);font-size:12px;letter-spacing:.14em;text-transform:uppercase}
-nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-nav a{color:var(--mut);text-decoration:none;padding:6px 12px;border-radius:999px;font-weight:600;font-size:14px}
-nav a.on{color:#fff;background:rgba(167,139,250,.2);box-shadow:inset 0 0 0 1px rgba(167,139,250,.5)}
-h1{font-size:22px;margin:14px 0 4px}
-h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);margin:26px 0 10px}
-.mut{color:var(--mut)}.kv{color:var(--mut);font-size:13px}.kv b{color:var(--txt)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;margin:10px 0;box-shadow:0 8px 30px rgba(0,0,0,.25)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:14px 0}
-.tile{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px}
-.tl{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.12em}
-.tv{font-size:22px;font-weight:800;margin:2px 0}.ts{color:var(--mut);font-size:12px}
-.bar{height:6px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden;margin:8px 0 6px}
+body{font:15px/1.6 "Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--txt);min-height:100vh;
+background:radial-gradient(1000px 600px at 90% -10%,rgba(167,139,250,.25),transparent 60%),radial-gradient(900px 600px at -10% 10%,rgba(34,211,238,.18),transparent 55%),radial-gradient(700px 500px at 60% 120%,rgba(244,114,182,.14),transparent 60%),var(--bg);background-attachment:fixed}
+a{color:inherit}
+.wrap{max-width:1040px;margin:0 auto;padding:0 16px 56px}
+.topbar{position:sticky;top:0;z-index:5;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);background:rgba(7,8,18,.72);border-bottom:1px solid var(--line);margin:0 -16px 18px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none}
+.badge{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,var(--c1),var(--c2) 55%,var(--c3));display:grid;place-items:center;box-shadow:0 6px 22px rgba(167,139,250,.35)}
+.badge svg{width:18px;height:18px;fill:#0b0b1a}
+.bname{font-weight:900;letter-spacing:.14em;font-size:15px;background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
+.bsub{color:var(--mut);font-size:10.5px;letter-spacing:.2em;text-transform:uppercase}
+.menu{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.menu a{color:var(--mut);text-decoration:none;padding:7px 13px;border-radius:999px;font-weight:600;font-size:13.5px;transition:.15s}
+.menu a:hover{color:#fff;background:rgba(255,255,255,.06)}
+.menu a.on{color:#fff;background:linear-gradient(90deg,rgba(34,211,238,.2),rgba(167,139,250,.24));box-shadow:inset 0 0 0 1px rgba(167,139,250,.45)}
+.menu a.tg{color:#7dd3fc}
+.who{color:var(--mut);font-size:12px;padding:0 6px}
+.hero{padding:10px 2px 4px}
+h1{font-size:26px;margin:0 0 2px;letter-spacing:-.01em}
+.sec{font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--mut);margin:28px 0 12px;display:flex;align-items:center;gap:10px}
+.sec:after{content:"";flex:1;height:1px;background:var(--line)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.28);backdrop-filter:blur(8px)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+.tile{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:16px;position:relative;overflow:hidden}
+.tile:before{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,var(--c1),var(--c2),var(--c3))}
+.tl{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.14em}
+.tv{font-size:21px;font-weight:800;margin:4px 0 2px;letter-spacing:-.01em}
+.ts{color:var(--mut);font-size:12px}
+.bar{height:7px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden;margin:10px 0 6px}
 .bar i{display:block;height:100%;border-radius:99px}
-.row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--line)}
-.row:last-child{border-bottom:0}
+.bots{display:grid;gap:10px}
+.botrow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 16px;border-radius:16px;background:var(--panel2);border:1px solid var(--line);transition:.15s}
+.botrow:hover{border-color:rgba(167,139,250,.45);transform:translateY(-1px)}
 .name{font-weight:700;font-size:16px}
+.name a{text-decoration:none}
+.kv{color:var(--mut);font-size:13px}.kv b{color:var(--txt)}
+.mut{color:var(--mut)}
 .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid}
 .pill:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
@@ -714,11 +984,11 @@ h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut)
 button,.btn{font:inherit;font-weight:600;padding:8px 14px;border-radius:11px;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--txt);cursor:pointer;text-decoration:none;display:inline-block;transition:transform .08s,filter .15s}
 button:hover,.btn:hover{filter:brightness(1.15)}
 button:active,.btn:active{transform:scale(.97)}
-.btn.pri{border:0;color:#0b0b1a;background:linear-gradient(90deg,var(--c1),var(--c2));box-shadow:0 6px 20px rgba(34,211,238,.25)}
+.btn.pri{border:0;color:#0b0b1a;background:linear-gradient(90deg,var(--c1),var(--c2));box-shadow:0 6px 22px rgba(34,211,238,.25)}
 .btn.ok{background:rgba(52,211,153,.15);border-color:rgba(52,211,153,.45);color:#a7f3d0}
 .btn.dng{background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.45);color:#fecdd3}
 .btn.ghost{background:transparent}.btn.sm{padding:5px 11px;font-size:13px}.wide{width:100%}
-input[type=text],input[type=password],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt);font-family:ui-monospace,Menlo,Consolas,monospace}
+input[type=text],input[type=password],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt)}
 input:focus,select:focus{outline:2px solid rgba(34,211,238,.45);border-color:transparent}
 label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 .mini{display:inline-flex;gap:5px;align-items:center;font-weight:500;color:var(--mut);margin-left:4px}
@@ -735,12 +1005,21 @@ label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 pre.log{white-space:pre-wrap;word-break:break-word;background:rgba(3,4,12,.85);border:1px solid var(--line);border-radius:14px;padding:14px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;color:#cbd5e1;max-height:60vh;overflow:auto;margin:0}
 .log .err{color:#fda4af}.log .warn{color:#fde68a}.log .sep{color:var(--c1);font-weight:700}
 .empty{color:var(--mut);text-align:center;padding:24px}
+.ugrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.ucard{background:var(--panel2);border:1px solid var(--line);border-radius:18px;padding:16px;display:flex;flex-direction:column;gap:6px}
+.uhead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.ubars{margin-top:6px}
+.mbar{height:6px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden;margin:4px 0 8px}
+.mbar i{display:block;height:100%;border-radius:99px}
 .auth{min-height:88vh;display:flex;align-items:center;justify-content:center}
-.authbox{width:100%;max-width:380px}.center{text-align:center}
+.authbox{width:100%;max-width:400px}.center{text-align:center}
 .spin{display:inline-block;animation:sp 1s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
 form{margin:0}.inline{display:inline}
-footer{margin-top:30px;text-align:center;color:var(--mut);font-size:12px;letter-spacing:.12em}
+footer{margin-top:34px;text-align:center;color:var(--mut);font-size:12px;letter-spacing:.06em;line-height:1.9}
+footer a{color:#7dd3fc;text-decoration:none}
 """
+
+BOLT_SVG = "<svg viewBox='0 0 24 24'><path d='M13 2 4 14h6l-1 8 9-12h-6z'/></svg>"
 
 
 def page(title, body, refresh=0):
@@ -749,7 +1028,12 @@ def page(title, body, refresh=0):
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<meta name=robots content='noindex,nofollow'>" + meta +
             "<title>" + esc(title) + "</title><style>" + CSS + "</style></head>"
-            "<body><main>" + body + "</main></body></html>")
+            "<body><div class=wrap>" + body + "</div></body></html>")
+
+
+def footer():
+    return ("<footer>" + esc(PANEL_NAME) + " · V " + esc(VERSION) + "<br>Developer <b>" + esc(DEVELOPER) +
+            "</b> · Telegram <a href='" + TG_URL + "' target=_blank rel=noopener>" + esc(TG_HANDLE) + " ↗</a></footer>")
 
 
 def layout(s, title, body, active="", refresh=0):
@@ -761,12 +1045,15 @@ def layout(s, title, body, active="", refresh=0):
         links.append(("users", "/users", "Users"))
     links.append(("acct", "/account", "Account"))
     nav = "".join("<a class='%s' href='%s'>%s</a>" % ("on" if k == active else "", h, t) for k, h, t in links)
-    top = ("<header class=top><div class=brand><span class=logo>TBP</span><span class=tag>Userbot Panel</span></div>"
-           "<nav>" + nav + "<span class=kv>" + esc(s["user"]) + " · " + esc(s["role"]) + "</span>"
+    nav += "<a class=tg href='%s' target=_blank rel=noopener>Telegram ↗</a>" % TG_URL
+    top = ("<header class=topbar>"
+           "<a class=brand href='/'><span class=badge>" + BOLT_SVG + "</span>"
+           "<span><div class=bname>" + esc(PANEL_NAME) + "</div><div class=bsub>Userbot Panel</div></span></a>"
+           "<nav class=menu>" + nav +
+           "<span class=who>" + esc(s["user"]) + " · " + esc(s["role"]) + "</span>"
            "<form method=post action=/logout><input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
            "<button class='btn ghost sm'>Logout</button></form></nav></header>")
-    foot = "<footer>TBP v%s</footer>" % VERSION
-    return page(title, top + flash + body + foot, refresh)
+    return page(title, top + flash + body + footer(), refresh)
 
 
 def reveal_box(s):
@@ -779,24 +1066,35 @@ def reveal_box(s):
             "<code>" + esc(rv[1]) + "</code></div>")
 
 
+def bar_color(p):
+    if p < 70:
+        return "linear-gradient(90deg,#22d3ee,#a78bfa)"
+    if p < 90:
+        return "linear-gradient(90deg,#fbbf24,#f97316)"
+    return "linear-gradient(90deg,#fb7185,#f472b6)"
+
+
 def tile(label, value, p=None, sub=""):
     bar = ""
     if p is not None:
-        c = "linear-gradient(90deg,#22d3ee,#a78bfa)" if p < 70 else ("#fbbf24" if p < 90 else "#fb7185")
-        bar = "<div class=bar><i style='width:%d%%;background:%s'></i></div>" % (p, c)
+        bar = "<div class=bar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
     return ("<div class=tile><div class=tl>%s</div><div class=tv>%s</div>%s<div class=ts>%s</div></div>"
             % (esc(label), esc(value), bar, esc(sub)))
+
+
+def mini_bar(p):
+    return "<div class=mbar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
 
 
 def bot_row(m, show_owner):
     label, cls = state_of(m)
     bid = m["id"]
     owner = (" · owner " + esc(m.get("owner", ""))) if show_owner else ""
-    return ("<div class=row><div><div class=name><a href='/bot/%s' style='color:inherit;text-decoration:none'>%s</a></div>"
-            "<div class=kv>%s%s · %s</div></div><div class=acts><span class='pill %s'>%s</span>"
-            "<a class='btn sm' href='/bot/%s'>Open</a></div></div>"
+    return ("<a class=botrow href='/bot/%s' style='text-decoration:none'>"
+            "<div><div class=name>%s</div><div class=kv>%s%s · %s</div></div>"
+            "<div class=acts><span class='pill %s'>%s</span></div></a>"
             % (bid, esc(m.get("name", "")), esc(m.get("kind", "").upper()), owner, esc(m.get("msg", "")),
-               cls, esc(label), bid))
+               cls, esc(label)))
 
 
 def upload_card(csrf):
@@ -809,7 +1107,7 @@ def upload_card(csrf):
             "<div class=kv style='margin-top:12px'>Never installed here: "
             "<span class='tag2 blk'>opencv-python</span><span class='tag2 blk'>numpy</span><span class='tag2 blk'>ddddocr</span></div>"
             "<div class=kv style='margin-top:8px'>Rejected automatically: bot-hosting code, server control, "
-            "shell/reverse-shell, miners and obfuscated exec.</div>"
+            "shell / reverse shell, miners and obfuscated exec. 3 violations = account ban.</div>"
             "</form></div>")
 
 
@@ -829,9 +1127,42 @@ def ufm(csrf, act, user, label, cls, inner=""):
             "<button class='btn " + cls + "'>" + esc(label) + "</button></form> ")
 
 
-# ---------- HTTP handler ----------
+def ucard(name, r, csrf, me, nbots, ram, disk):
+    is_admin = r.get("role") == "admin"
+    banned = bool(r.get("disabled"))
+    head = ("<div class=uhead><div><div class=name>" + esc(name) + "</div>"
+            "<div class=kv>created " + fmt_time(r.get("created")) + "</div></div>"
+            "<div class=acts>" + ("<span class='pill info'>admin</span>" if is_admin else "<span class='pill mut'>user</span>") +
+            ("<span class='pill bad'>banned</span>" if banned else "<span class='pill ok'>active</span>") + "</div></div>")
+    flags = ("<div class=kv>bots <b>%d</b> · strikes <b>%d/%d</b>%s</div>"
+             % (nbots, int(r.get("strikes", 0)), STRIKE_LIMIT,
+                "" if has_key(r) else " · <span class='tag2'>no key</span>"))
+    if is_admin:
+        ram_txt, disk_txt = "no limit", "no limit"
+        bars = ""
+    else:
+        ram_p, disk_p = pct(ram, QUOTA_RAM_MB * MB), pct(disk, QUOTA_DISK_MB * MB)
+        ram_txt = "%s / %d MB" % (human(ram), QUOTA_RAM_MB)
+        disk_txt = "%s / %d MB" % (human(disk), QUOTA_DISK_MB)
+        bars = mini_bar(ram_p) + mini_bar(disk_p)
+    quotas = ("<div class=ubars><div class=kv>RAM <b>%s</b> · CPU <b>%s</b></div>%s"
+              "<div class=kv>Disk <b>%s</b></div></div>" % (ram_txt, "0.5 core" if not is_admin else "no limit", bars, disk_txt))
+    if me:
+        acts = "<span class=kv>(you — use Account page)</span>"
+    else:
+        acts = ufm(csrf, "reset", name, "New key", "sm")
+        acts += ufm(csrf, "toggle", name, "Unban" if banned else "Ban", "sm" if banned else "sm dng")
+        acts += ufm(csrf, "role", name, "Make user" if is_admin else "Make admin", "sm")
+        acts += ufm(csrf, "delete", name, "Delete", "sm dng",
+                    "<label class=mini><input type=checkbox name=confirm value=yes required> confirm</label>")
+    return "<div class=ucard>" + head + flags + quotas + "<div class=acts style='margin-top:8px'>" + acts + "</div></div>"
+
+
+# =====================================================
+#  HTTP handler
+# =====================================================
 class H(BaseHTTPRequestHandler):
-    server_version = "TBP"
+    server_version = "TURBO"
     sys_version = ""
 
     def log_message(self, *a):
@@ -978,15 +1309,19 @@ class H(BaseHTTPRequestHandler):
     # ----- auth -----
     def login_page(self, err=""):
         e = "<div class='flash bad'>%s</div>" % esc(err) if err else ""
-        body = ("<div class=auth><div class=authbox><div class=center><span class=logo>TBP</span></div>"
-                "<p class='center mut'>Enter your access key</p>" + e +
+        body = ("<div class=auth><div class=authbox>"
+                "<div class=center><span class=badge style='display:inline-grid;width:56px;height:56px;border-radius:18px'>"
+                + BOLT_SVG.replace("<svg", "<svg style='width:28px;height:28px;fill:#0b0b1a'") +
+                "</span><h1 style='margin-top:14px'>" + esc(PANEL_NAME) + "</h1>"
+                "<p class='center mut' style='margin-top:0'>Userbot control panel · enter your access key</p></div>" + e +
                 "<div class=card><form method=post action=/login>"
                 "<label>Access key</label>"
                 "<input type=password name=key autocomplete=off autocapitalize=off spellcheck=false required placeholder='tbp_...'>"
                 "<button class='btn pri wide'>Sign in</button></form>"
-                "<p class='mut center' style='font-size:12px;margin-top:12px'>No key? Ask the admin.</p>"
-                "</div></div></div>")
-        self.send_html(200, page("TBP · Login", body))
+                "<p class='mut center' style='font-size:12.5px;margin:14px 0 0'>No key? Ask the admin on "
+                "<a href='" + TG_URL + "' target=_blank rel=noopener style='color:#7dd3fc'>" + esc(TG_HANDLE) + "</a></p>"
+                "</div>" + footer() + "</div></div>")
+        self.send_html(200, page("TURBO CHANNEL · Login", body))
 
     def do_login(self, f):
         ip, now = self.ip(), time.time()
@@ -1023,25 +1358,34 @@ class H(BaseHTTPRequestHandler):
     # ----- pages -----
     def dash(self, s):
         admin = s["role"] == "admin"
-        tiles = ""
+        top = ""
         if admin:
             st = stats()
             mp = pct(st["mem_used"], st["mem_total"])
             dp = pct(st["disk_used"], st["disk_total"])
             cores = st["cores"]
-            tiles = ("<div class=grid>"
-                     + tile("CPU load", "%.2f" % st["load1"], min(100, int(st["load1"] * 100 / cores)),
-                            "%d cores · %s" % (cores, " ".join(st["load"])))
-                     + tile("Memory", "%d%%" % mp, mp, "%s / %s" % (human(st["mem_used"]), human(st["mem_total"])))
-                     + tile("Disk /", "%d%%" % dp, dp, "%s / %s" % (human(st["disk_used"]), human(st["disk_total"])))
-                     + tile("Uptime", st["uptime"], None, st["host"]) + "</div>")
-        bots = list_bots() if admin else list_bots(owner=s["user"])
+            tun = "<span class='pill %s'>Tunnel %s</span>" % ("ok" if tunnel_up() else "bad", "up" if tunnel_up() else "down")
+            top = ("<div class=kv style='margin-top:8px'>" + tun + "</div>"
+                   "<div class=grid style='margin-top:14px'>"
+                   + tile("CPU load", "%.2f" % st["load1"], min(100, int(st["load1"] * 100 / cores)),
+                          "%d cores · %s" % (cores, " ".join(st["load"])))
+                   + tile("Memory", "%d%%" % mp, mp, "%s / %s" % (human(st["mem_used"]), human(st["mem_total"])))
+                   + tile("Disk /", "%d%%" % dp, dp, "%s / %s" % (human(st["disk_used"]), human(st["disk_total"])))
+                   + tile("Uptime", st["uptime"], None, st["host"]) + "</div>")
+            bots = list_bots()
+            heading = "All bots"
+            sub = "Server health &amp; every userbot on this VPS"
+        else:
+            top = quota_tiles(s["user"])
+            bots = list_bots(owner=s["user"])
+            heading = "Your bots"
+            sub = "Your resources and userbots"
         rows = "".join(bot_row(m, admin) for m in bots) or "<div class=empty>No bots yet. Upload one below ↓</div>"
-        heading = "All bots" if admin else "Your bots"
-        body = ("<h1>Dashboard</h1><div class=mut>" + ("Server health &amp; all userbots" if admin else "Your userbots") + "</div>"
-                + tiles + "<h2>" + heading + "</h2><div class=card>" + rows + "</div>"
-                "<h2>Upload a bot</h2>" + upload_card(s["csrf"]))
-        self.send_html(200, layout(s, "TBP · Dashboard", body, "dash"))
+        body = ("<div class=hero><h1>Welcome, " + esc(s["user"]) + "</h1><div class=mut>" + sub + "</div></div>"
+                "<div class=sec>Overview</div>" + top +
+                "<div class=sec>" + heading + "</div><div class=card><div class=bots>" + rows + "</div></div>"
+                "<div class=sec>Upload a bot</div>" + upload_card(s["csrf"]))
+        self.send_html(200, layout(s, "TURBO CHANNEL · Dashboard", body, "dash"))
 
     def bot_page(self, s, m, bid):
         csrf = s["csrf"]
@@ -1065,7 +1409,8 @@ class H(BaseHTTPRequestHandler):
         viol = m.get("violations") or []
         viol_html = ""
         if viol:
-            viol_html = ("<h2>Scanner findings</h2><div class=card><pre class=log>" + esc("\n".join(viol)) + "</pre></div>")
+            viol_html = ("<div class=sec>Scanner findings</div><div class=card><pre class=log>"
+                         + esc("\n".join(viol)) + "</pre></div>")
         extra_form = ("<form method=post action=/action>"
                       "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
                       "<input type=hidden name=id value='" + bid + "'>"
@@ -1078,19 +1423,20 @@ class H(BaseHTTPRequestHandler):
         body = ("<h1>" + esc(m.get("name", "")) + "</h1>"
                 "<div class=mut>" + esc(m.get("kind", "").upper()) + " bot · owner <b>" + esc(m.get("owner", "")) +
                 "</b> · id " + bid + "</div>"
-                "<h2>Status</h2><div class=card>"
-                "<div class=row><div>" + spin + "<span class='pill " + cls + "'>" + esc(label) + "</span></div>"
+                "<div class=sec>Status</div><div class=card>"
+                "<div class=row style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px'>"
+                "<div>" + spin + "<span class='pill " + cls + "'>" + esc(label) + "</span></div>"
                 "<div class=kv>PID <b>" + esc(m.get("pid") or "-") + "</b></div></div>"
                 "<div class=kv style='margin-top:8px'>" + esc(m.get("msg", "")) + "</div>"
                 "<div class=acts style='margin-top:12px'>" + btns + "</div></div>"
-                "<h2>Packages</h2><div class=card>" + pills + blk_note + "</div>"
+                "<div class=sec>Packages</div><div class=card>" + pills + blk_note + "</div>"
                 + viol_html +
-                "<h2>Extra packages</h2><div class=card>" + extra_form + "</div>"
-                "<h2>Logs</h2><div class=acts style='margin-bottom:8px'>"
+                "<div class=sec>Extra packages</div><div class=card>" + extra_form + "</div>"
+                "<div class=sec>Logs</div><div class=acts style='margin-bottom:8px'>"
                 "<a class=btn href='/bot/" + bid + "/log'>Full log</a><a class=btn href='/bot/" + bid + "'>Refresh</a></div>"
                 "<pre class=log>" + logs + "</pre>"
-                "<div style='margin-top:16px'><a class=btn href='/'>← Dashboard</a></div>")
-        self.send_html(200, layout(s, "TBP · " + m.get("name", ""), body, "dash", refresh))
+                "<div style='margin-top:18px'><a class=btn href='/'>← Dashboard</a></div>")
+        self.send_html(200, layout(s, "TURBO CHANNEL · " + m.get("name", ""), body, "dash", refresh))
 
     def log_page(self, s, m, bid):
         label, _ = state_of(m)
@@ -1099,47 +1445,33 @@ class H(BaseHTTPRequestHandler):
                 "<div class=acts style='margin:14px 0'><a class=btn href='/bot/" + bid + "'>← Back</a>"
                 "<a class=btn href='/bot/" + bid + "/log'>Refresh</a></div>"
                 "<pre class=log>" + colorize(tail(os.path.join(bdir(bid), "bot.log"), 300)) + "</pre>")
-        self.send_html(200, layout(s, "TBP · Logs", body, "dash", refresh))
+        self.send_html(200, layout(s, "TURBO CHANNEL · Logs", body, "dash", refresh))
 
     def account_page(self, s):
-        body = ("<h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · " + esc(s["role"]) + "</div>"
-                + reveal_box(s) +
-                "<h2>My access key</h2><div class=card>"
-                "<p class=mut style='margin-top:0'>Lost your key? Generate a new one. Your old key and your other "
-                "sessions stop working immediately.</p>"
-                "<form method=post action=/account/key>"
-                "<input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
-                "<label class=chk><input type=checkbox name=confirm value=yes required> I understand my current key will stop working</label>"
-                "<button class='btn pri wide'>Generate new key</button></form></div>")
-        self.send_html(200, layout(s, "TBP · Account", body, "acct"))
+        body = ("<div class=hero><h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · "
+                + esc(s["role"]) + "</div></div>" + reveal_box(s) +
+                "<div class=sec>My resources</div>" + quota_tiles(s["user"]) if s["role"] != "admin" else
+                "<div class=hero><h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · admin</div></div>"
+                + reveal_box(s))
+        body += ("<div class=sec>My access key</div><div class=card>"
+                 "<p class=mut style='margin-top:0'>Lost your key? Generate a new one. Your old key and your other "
+                 "sessions stop working immediately.</p>"
+                 "<form method=post action=/account/key>"
+                 "<input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
+                 "<label class=chk><input type=checkbox name=confirm value=yes required> I understand my current key will stop working</label>"
+                 "<button class='btn pri wide'>Generate new key</button></form></div>")
+        self.send_html(200, layout(s, "TURBO CHANNEL · Account", body, "acct"))
 
     def users_page(self, s):
         users = users_load()
-        counts = {}
-        for m in list_bots():
-            counts[m.get("owner")] = counts.get(m.get("owner"), 0) + 1
         csrf = s["csrf"]
-        rows = ""
+        cards = ""
         for name in sorted(users):
             r = users[name]
-            me = name == s["user"]
-            is_admin = r.get("role") == "admin"
-            disabled = bool(r.get("disabled"))
-            badge = "<span class='pill info'>admin</span>" if is_admin else "<span class='pill mut'>user</span>"
-            status = "<span class='pill bad'>disabled</span>" if disabled else "<span class='pill ok'>active</span>"
-            if not has_key(r):
-                status += " <span class='pill warn'>no key</span>"
-            if me:
-                acts = "<span class=kv>(you — use Account page)</span>"
-            else:
-                acts = ufm(csrf, "reset", name, "New key", "sm")
-                acts += ufm(csrf, "toggle", name, "Enable" if disabled else "Disable", "sm" if disabled else "sm dng")
-                acts += ufm(csrf, "role", name, "Make user" if is_admin else "Make admin", "sm")
-                acts += ufm(csrf, "delete", name, "Delete", "sm dng",
-                            "<label class=mini><input type=checkbox name=confirm value=yes required> confirm</label>")
-            rows += ("<div class=row><div><div class=name>" + esc(name) + " " + badge + "</div>"
-                     "<div class=kv>bots: <b>" + str(counts.get(name, 0)) + "</b> · created " + fmt_time(r.get("created")) +
-                     "</div></div><div class=acts>" + status + " " + acts + "</div></div>")
+            nb = len(list_bots(owner=name))
+            ram = owner_ram_used(name) if r.get("role") != "admin" else 0
+            disk = user_disk(name) if r.get("role") != "admin" else 0
+            cards += ucard(name, r, csrf, name == s["user"], nb, ram, disk)
         create = ("<div class=card><form method=post action=/users/action>"
                   "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
                   "<input type=hidden name=act value='create'>"
@@ -1147,10 +1479,11 @@ class H(BaseHTTPRequestHandler):
                   "<input type=text name=user autocomplete=off required>"
                   "<label>Role</label><select name=role><option value=user>User</option><option value=admin>Admin</option></select>"
                   "<button class='btn pri wide'>Create account &amp; generate key</button></form></div>")
-        body = ("<h1>Users</h1><div class=mut>Create accounts, issue access keys, disable or delete users</div>"
-                + reveal_box(s) + "<h2>Accounts</h2><div class=card>" + rows + "</div>"
-                "<h2>New account</h2>" + create)
-        self.send_html(200, layout(s, "TBP · Users", body, "users"))
+        body = ("<div class=hero><h1>Users</h1><div class=mut>Quota per user: RAM "
+                + str(QUOTA_RAM_MB) + " MB · CPU " + str(QUOTA_CPU) + " core · Disk " + str(QUOTA_DISK_MB) + " MB</div></div>"
+                + reveal_box(s) + "<div class=sec>Accounts</div><div class=ugrid>" + cards + "</div>"
+                "<div class=sec>New account</div>" + create)
+        self.send_html(200, layout(s, "TURBO CHANNEL · Users", body, "users"))
 
     # ----- actions -----
     def do_upload(self, s, f, files):
@@ -1170,18 +1503,24 @@ class H(BaseHTTPRequestHandler):
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             return self.flash_go(s, "bad", "File must be UTF-8 text", "/")
+        if s["role"] != "admin" and user_disk(s["user"]) + len(data) > QUOTA_DISK_MB * MB:
+            return self.flash_go(s, "bad", "Disk quota exceeded (%d MB) - delete a bot first" % QUOTA_DISK_MB, "/")
         kind = "py" if ext == ".py" else "js"
         try:
             viol, _ = analyze(kind, text)
         except ValueError as e:
             return self.flash_go(s, "bad", str(e), "/")
         if viol:
-            return self.flash_go(s, "bad", "Blocked by code scanner: " + viol[0][:150], "/")
+            strikes, banned = add_strike(s["user"])
+            if banned:
+                return self.flash_go(s, "bad", "Account banned after %d violations - contact the admin" % STRIKE_LIMIT, "/")
+            return self.flash_go(s, "bad", "Blocked by code scanner (%d/%d): %s"
+                                 % (strikes, STRIKE_LIMIT, viol[0][:120]), "/")
 
         bid = secrets.token_hex(6)
-        fname_on_disk = "bot" + ext
         d = bdir(bid)
         os.makedirs(d, mode=0o755)
+        fname_on_disk = "bot" + ext
         with open(os.path.join(d, fname_on_disk), "wb") as fh:
             fh.write(data)
         m = {"id": bid, "name": base, "file": fname_on_disk, "kind": kind, "status": "installing",
@@ -1233,6 +1572,7 @@ class H(BaseHTTPRequestHandler):
                 return self.flash_go(s, "bad", "Tick 'confirm' to delete", back)
             stop_bot(bid)
             shutil.rmtree(bdir(bid), ignore_errors=True)
+            drop_bot_user(bid)
             return self.flash_go(s, "ok", "Bot deleted", "/")
         return self.flash_go(s, "bad", "Unknown action", back)
 
@@ -1241,24 +1581,28 @@ class H(BaseHTTPRequestHandler):
             return self.flash_go(s, "bad", "Admins only", "/")
         act = f.get("act", "")
         name = f.get("user", "").strip().lower()
-        users = users_load()
         back = "/users"
 
         if act == "create":
             role = f.get("role", "user")
             if not valid_name(name):
                 return self.flash_go(s, "bad", "Invalid username (3-32 chars: a-z, 0-9, _ . -)", back)
-            if name in users:
-                return self.flash_go(s, "bad", "Username already exists", back)
             if role not in ("user", "admin"):
                 role = "user"
-            users[name] = new_record(role)
-            key = issue_key(users[name])
-            users_save(users)
+            with LOCK:
+                users = users_load()
+                if name in users:
+                    return self.flash_go(s, "bad", "Username already exists", back)
+                users[name] = new_record(role)
+                key = issue_key(users[name])
+                users_save(users)
+            if role != "admin":
+                cg_setup(name)
             with LOCK:
                 s["reveal"] = (name, key)
             return self.flash_go(s, "ok", "Account created - key shown below (once)", back)
 
+        users = users_load()
         if name not in users:
             return self.flash_go(s, "bad", "User not found", back)
         if name == s["user"]:
@@ -1268,8 +1612,10 @@ class H(BaseHTTPRequestHandler):
         is_last_admin = rec.get("role") == "admin" and name in admins_on and len(admins_on) == 1
 
         if act == "reset":
-            key = issue_key(rec)
-            users_save(users)
+            with LOCK:
+                users = users_load()
+                key = issue_key(users[name])
+                users_save(users)
             kill_sessions(name)
             with LOCK:
                 s["reveal"] = (name, key)
@@ -1277,19 +1623,28 @@ class H(BaseHTTPRequestHandler):
 
         if act == "toggle":
             if not rec.get("disabled") and is_last_admin:
-                return self.flash_go(s, "bad", "Cannot disable the last active admin", back)
-            rec["disabled"] = not rec.get("disabled")
-            users_save(users)
-            if rec["disabled"]:
+                return self.flash_go(s, "bad", "Cannot ban the last active admin", back)
+            with LOCK:
+                users = users_load()
+                users[name]["disabled"] = not rec.get("disabled")
+                if not users[name]["disabled"]:
+                    users[name]["strikes"] = 0
+                users_save(users)
+            if not rec.get("disabled"):
+                for m in list_bots(owner=name):
+                    stop_bot(m["id"])
                 kill_sessions(name)
-            return self.flash_go(s, "ok", ("Disabled " if rec["disabled"] else "Enabled ") + name, back)
+                return self.flash_go(s, "ok", "Banned " + name, back)
+            return self.flash_go(s, "ok", "Unbanned " + name + " (strikes reset)", back)
 
         if act == "role":
             new_role = "user" if rec.get("role") == "admin" else "admin"
             if new_role == "user" and is_last_admin:
                 return self.flash_go(s, "bad", "Cannot demote the last active admin", back)
-            rec["role"] = new_role
-            users_save(users)
+            with LOCK:
+                users = users_load()
+                users[name]["role"] = new_role
+                users_save(users)
             return self.flash_go(s, "ok", name + " is now " + new_role, back)
 
         if act == "delete":
@@ -1300,9 +1655,18 @@ class H(BaseHTTPRequestHandler):
             for m in list_bots(owner=name):
                 stop_bot(m["id"])
                 shutil.rmtree(bdir(m["id"]), ignore_errors=True)
-            users.pop(name, None)
-            users_save(users)
+                drop_bot_user(m["id"])
+            with LOCK:
+                users = users_load()
+                users.pop(name, None)
+                users_save(users)
             kill_sessions(name)
+            d = cg_dir(name)
+            if os.path.isdir(d):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
             return self.flash_go(s, "ok", "Account and its bots deleted", back)
 
         return self.flash_go(s, "bad", "Unknown action", back)
@@ -1310,32 +1674,33 @@ class H(BaseHTTPRequestHandler):
     def do_own_key(self, s, f):
         if f.get("confirm") != "yes":
             return self.flash_go(s, "bad", "Tick the confirmation box first", "/account")
-        users = users_load()
-        rec = users.get(s["user"])
-        if not rec or rec.get("disabled"):
-            return self.flash_go(s, "bad", "Account unavailable", "/account")
-        key = issue_key(rec)
-        users_save(users)
+        with LOCK:
+            users = users_load()
+            rec = users.get(s["user"])
+            if not rec or rec.get("disabled"):
+                return self.flash_go(s, "bad", "Account unavailable", "/account")
+            key = issue_key(rec)
+            users_save(users)
         kill_sessions(s["user"], keep=s["tok"])
         with LOCK:
             s["reveal"] = (s["user"], key)
         self.go("/account")
 
 
+# =====================================================
+#  Entry point
+# =====================================================
 def main():
-    global BOT_RUN_AS
-    if sys.version_info < (3, 10):
-        sys.exit("TBP needs Python 3.10 or newer")
     a = sys.argv
     if len(a) == 3 and a[1] in ("--set-password", "--new-key"):
         os.makedirs(HOME, mode=0o700, exist_ok=True)
         return cli_new_key(a[2])
     os.makedirs(BOTS, mode=0o711, exist_ok=True)
-    if os.geteuid() == 0:
-        os.chmod(HOME, 0o711)          # bot user must traverse to its own folder
+    if IS_ROOT:
+        os.chmod(HOME, 0o711)
         os.chmod(BOTS, 0o711)
-    BOT_RUN_AS = ensure_bot_user()
-    admins = active_admins(users_load())
+    users = users_load()
+    admins = active_admins(users)
     if not admins:
         sys.exit("No active admin key. Run: sudo python3 app.py --set-password admin")
     first_admin = sorted(admins)[0]
@@ -1347,12 +1712,19 @@ def main():
             upd.update(status="error", msg="Interrupted - click 'Reinstall packages'")
         if upd:
             meta_update(m["id"], **upd)
-        if os.geteuid() == 0 and os.path.isdir(bdir(m["id"])):
+        if IS_ROOT:
+            ensure_bot_user(m["id"])
             harden(m["id"])
-    if os.geteuid() == 0 and not BOT_RUN_AS:
-        print("WARNING: could not create sandbox user '%s'; bots will not start" % BOT_USER, flush=True)
+    if IS_ROOT:
+        for name, rec in users.items():
+            if rec.get("role") != "admin":
+                cg_setup(name)
+        if not cg_ready_host():
+            print("NOTE: cgroup v2 not available - RAM/CPU quota runs in SOFT mode", flush=True)
+    else:
+        print("NOTE: not running as root - bots run as this user; quotas are SOFT", flush=True)
     threading.Thread(target=watchdog, daemon=True).start()
-    print("TBP panel v%s running on http://127.0.0.1:%d" % (VERSION, PORT), flush=True)
+    print("TURBO CHANNEL V %s · Userbot Web Panel · http://127.0.0.1:%d" % (VERSION, PORT), flush=True)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     try:
         srv.serve_forever()
