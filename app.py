@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =====================================================
-#  TURBO VPS PANEL - Userbot Web Panel · V 2.7
+#  TURBO VPS PANEL - Userbot Web Panel · V 2.8
 #  Developer: TURBO   ·   Telegram: https://t.me/arsar2027
 #
 #  - Access-key login (no passwords). Admin issues keys; shown once.
@@ -9,6 +9,7 @@
 #  - Quota per user: RAM 256 MB · CPU 0.5 core · Disk 1024 MB
 #      HARD via cgroup v2 when available, otherwise SOFT (watchdog)
 #  - Every bot runs as its own OS user (tbpb_<id>)
+#  - Bot venvs never use a Python under /root or /home (fixes Errno 13)
 #  - Scanner: 3 hosting/malware violations = automatic ban
 #  - Telegram bot lives in tbp_bot.py (separate process). This app only
 #    exposes a LOCAL /internal API, protected by a shared secret.
@@ -30,7 +31,7 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.7"
+VERSION = "2.8"
 PANEL_NAME = "TURBO VPS PANEL"
 DEVELOPER = "TURBO"
 TG_HANDLE = "@arsar2027"
@@ -56,6 +57,7 @@ MAX_RESTARTS = 5
 CG_ROOT = "/sys/fs/cgroup"
 CG_BASE = os.path.join(CG_ROOT, "tbp")
 IS_ROOT = os.geteuid() == 0
+UNSAFE_PREFIXES = ("/root/", "/home/")   # bot OS users cannot execute from here
 
 SESSIONS, FAILS, PROCS = {}, {}, {}
 LOCK = threading.RLock()
@@ -597,7 +599,6 @@ def harden(bid):
             os.chmod(p, 0o700)
             continue
         if name == "venv" and os.path.isdir(p):
-            # venv is root-owned runtime code: readable by the bot user, never writable by it
             for root, dirs, files in os.walk(p):
                 for x in dirs:
                     fp = os.path.join(root, x)
@@ -822,21 +823,52 @@ def apt_install(pkgs):
     return rc == 0, out[-400:]
 
 
+def venv_py_ok(py):
+    """True when the venv interpreter exists and is NOT inside /root or /home."""
+    return os.path.isfile(py) and not os.path.realpath(py).startswith(UNSAFE_PREFIXES)
+
+
+def safe_python():
+    """Pick a system Python that every OS user can execute (never one under /root or /home)."""
+    candidates = ["/usr/bin/python3", "/usr/local/bin/python3", shutil.which("python3") or "", sys.executable]
+    for c in candidates:
+        if not c or not os.path.isfile(c):
+            continue
+        real = os.path.realpath(c)
+        if real.startswith(UNSAFE_PREFIXES):
+            continue
+        if os.access(real, os.X_OK):
+            return c
+    return None
+
+
 def ensure_venv(d):
+    """Creates (or repairs) the bot's venv. A venv whose interpreter lives under /root or
+    /home is deleted and rebuilt from a system Python, so the bot OS user can run it."""
     vdir = os.path.join(d, "venv")
     py = os.path.join(vdir, "bin", "python3")
-    if os.path.exists(py):
+    if venv_py_ok(py):
         return py, ""
-    rc, out = run_cmd([sys.executable, "-m", "venv", vdir], timeout=300)
+    shutil.rmtree(vdir, ignore_errors=True)
+    base = safe_python()
+    if not base:
+        ok, aout = apt_install(["python3"])
+        base = safe_python()
+        if not base:
+            return None, "No usable system python3 found. " + aout
+    rc, out = run_cmd([base, "-m", "venv", vdir], timeout=300)
     if rc != 0:
-        shutil.rmtree(vdir, ignore_errors=True)
         ok, aout = apt_install(["python3-venv"])
         if not ok:
+            shutil.rmtree(vdir, ignore_errors=True)
             return None, "python3-venv install failed: " + aout
-        rc, out = run_cmd([sys.executable, "-m", "venv", vdir], timeout=300)
+        rc, out = run_cmd([base, "-m", "venv", vdir], timeout=300)
         if rc != 0:
             shutil.rmtree(vdir, ignore_errors=True)
             return None, "venv creation failed: " + out[-300:]
+    if not venv_py_ok(py):
+        shutil.rmtree(vdir, ignore_errors=True)
+        return None, "venv python is still unsafe - check: readlink -f /opt/tb-panel/bots/<id>/venv/bin/python3"
     return py, ""
 
 
@@ -857,10 +889,13 @@ def install_py(d, pkgs, say):
     except FileNotFoundError:
         pass
     _write(cons, CONSTRAINTS)
+    say("Upgrading pip...")
+    run_cmd([py, "-m", "pip", "install", "--disable-pip-version-check", "-q", "--upgrade", "pip"], cwd=d, timeout=600)
     if not pkgs:
         return True, ""
     say("Installing Python packages...")
-    rc, out = run_cmd([py, "-m", "pip", "install", "--disable-pip-version-check", "-c", cons] + pkgs, cwd=d, timeout=1200)
+    rc, out = run_cmd([py, "-m", "pip", "install", "--disable-pip-version-check", "-c", cons] + pkgs,
+                      cwd=d, timeout=1200)
     if rc != 0:
         return False, pip_error(out)
     return True, ""
@@ -991,6 +1026,16 @@ def start_bot(bid, manual=True):
                 return False, "Disk quota exceeded (%d MB)" % QUOTA_DISK_MB
             if owner_ram_used(owner) >= QUOTA_RAM_MB * MB:
                 return False, "RAM quota reached (%d MB) - stop another bot first" % QUOTA_RAM_MB
+        d = bdir(bid)
+        if m["kind"] == "py":
+            cmd = [os.path.join(d, "venv", "bin", "python3"), os.path.join(d, m["file"])]
+            if not venv_py_ok(cmd[0]):
+                return False, "Python environment is outdated - click 'Reinstall packages' first"
+        else:
+            node = shutil.which("node")
+            if not node:
+                return False, "Node.js is missing - click 'Reinstall packages' first"
+            cmd = [node, os.path.join(d, m["file"])]
         pw = bot_pw(bid)
         if IS_ROOT and not pw:
             pw = ensure_bot_user(bid)
@@ -999,19 +1044,13 @@ def start_bot(bid, manual=True):
         cg = cg_setup(owner) if (IS_ROOT and is_user) else None
         harden(bid)
         prep_workdir(bid)
-        d = bdir(bid)
-        target = os.path.join(d, m["file"])
-        if m["kind"] == "py":
-            cmd = [os.path.join(d, "venv", "bin", "python3"), target]
-        else:
-            cmd = [shutil.which("node") or "node", target]
         logp = os.path.join(d, "bot.log")
         try:
             if os.path.getsize(logp) > 5 * MB:
                 os.replace(logp, logp + ".1")
         except OSError:
             pass
-        env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": workdir(bid),
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": workdir(bid),
                "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
         kw = {"preexec_fn": _child_limits()}
         if pw:
@@ -1022,6 +1061,8 @@ def start_bot(bid, manual=True):
                 lf.write(("\n=== start %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
                 p = subprocess.Popen(cmd, cwd=workdir(bid), env=env, stdin=subprocess.DEVNULL, stdout=lf,
                                      stderr=subprocess.STDOUT, start_new_session=True, **kw)
+        except PermissionError:
+            return False, "Permission denied - click 'Reinstall packages' to rebuild the environment"
         except OSError as e:
             return False, "Could not start: %s" % str(e)[:200]
         if cg:
