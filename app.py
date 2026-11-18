@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =====================================================
-#  TURBO CHANNEL - Userbot Web Panel · V 2.6
+#  TURBO VPS PANEL - Userbot Web Panel · V 2.7
 #  Developer: TURBO   ·   Telegram: https://t.me/arsar2027
 #
 #  - Access-key login (no passwords). Admin issues keys; shown once.
@@ -30,8 +30,8 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.6"
-PANEL_NAME = "TURBO CHANNEL"
+VERSION = "2.7"
+PANEL_NAME = "TURBO VPS PANEL"
 DEVELOPER = "TURBO"
 TG_HANDLE = "@arsar2027"
 TG_URL = "https://t.me/arsar2027"
@@ -578,8 +578,9 @@ def _chown(p, uid, gid):
 
 
 def harden(bid):
-    """Root owns the bot folder and secrets; the bot's own user can only read its
-    source and write its work/ folder."""
+    """Root owns the bot's source, secrets and the top of its folder. The bot's OS user
+    may READ the folder and its venv/ runtime (and execute venv/bin), and may WRITE
+    only work/. Other bots' OS users cannot enter this folder (750 on the bot dir)."""
     d = bdir(bid)
     m = meta_load(bid)
     pw = bot_pw(bid)
@@ -595,9 +596,34 @@ def harden(bid):
                 _chown(p, pw.pw_uid, pw.pw_gid)
             os.chmod(p, 0o700)
             continue
+        if name == "venv" and os.path.isdir(p):
+            # venv is root-owned runtime code: readable by the bot user, never writable by it
+            for root, dirs, files in os.walk(p):
+                for x in dirs:
+                    fp = os.path.join(root, x)
+                    if not os.path.islink(fp):
+                        _chown(fp, 0, gid)
+                        os.chmod(fp, 0o750 if pw else 0o755)
+                for x in files:
+                    fp = os.path.join(root, x)
+                    if not os.path.islink(fp):
+                        _chown(fp, 0, gid)
+                        os.chmod(fp, 0o640 if pw else 0o644)
+            _chown(p, 0, gid)
+            os.chmod(p, 0o750 if pw else 0o755)
+            vb = os.path.join(p, "bin")
+            if os.path.isdir(vb):
+                for x in os.listdir(vb):
+                    fp = os.path.join(vb, x)
+                    if not os.path.islink(fp):
+                        try:
+                            os.chmod(fp, 0o750 if pw else 0o755)
+                        except OSError:
+                            pass
+            continue
         if os.path.isdir(p):
-            _chown(p, 0, 0)
-            os.chmod(p, 0o755)
+            _chown(p, 0, gid)
+            os.chmod(p, 0o750 if pw else 0o755)
             continue
         if name == m.get("file") or name in ("constraints.txt", "package.json"):
             _chown(p, 0, gid)
@@ -683,6 +709,14 @@ def owner_ram_used(owner):
         if m.get("pid") and is_running(m["id"], m):
             total += proc_rss(m["pid"])
     return total
+
+
+def bar_color(p):
+    if p < 70:
+        return "linear-gradient(90deg,#22d3ee,#a78bfa)"
+    if p < 90:
+        return "linear-gradient(90deg,#fbbf24,#f97316)"
+    return "linear-gradient(90deg,#fb7185,#f472b6)"
 
 
 def tile(label, value, p=None, sub=""):
@@ -1276,14 +1310,6 @@ footer a{color:#7dd3fc;text-decoration:none}
 BOLT_SVG = "<svg viewBox='0 0 24 24'><path d='M13 2 4 14h6l-1 8 9-12h-6z'/></svg>"
 
 
-def bar_color(p):
-    if p < 70:
-        return "linear-gradient(90deg,#22d3ee,#a78bfa)"
-    if p < 90:
-        return "linear-gradient(90deg,#fbbf24,#f97316)"
-    return "linear-gradient(90deg,#fb7185,#f472b6)"
-
-
 def mini_bar(p):
     return "<div class=mbar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
 
@@ -1620,7 +1646,7 @@ class H(BaseHTTPRequestHandler):
                 "<p class='mut center' style='font-size:12.5px;margin:14px 0 0'>No key? Ask the admin on "
                 "<a href='" + TG_URL + "' target=_blank rel=noopener style='color:#7dd3fc'>" + esc(TG_HANDLE) + "</a></p>"
                 "</div>" + footer() + "</div></div>")
-        self.send_html(200, page("TURBO CHANNEL · Login", body))
+        self.send_html(200, page("TURBO VPS PANEL · Login", body))
 
     def do_login(self, f):
         ip, now = self.ip(), time.time()
@@ -1687,7 +1713,7 @@ class H(BaseHTTPRequestHandler):
                 "<div class=sec>Overview</div>" + top +
                 "<div class=sec>" + heading + "</div><div class=card><div class=bots>" + rows + "</div></div>"
                 "<div class=sec>Upload a bot</div>" + upload_card(s["csrf"]))
-        self.send_html(200, layout(s, "TURBO CHANNEL · Dashboard", body, "dash"))
+        self.send_html(200, layout(s, "TURBO VPS PANEL · Dashboard", body, "dash"))
 
     def bot_page(self, s, m, bid):
         csrf = s["csrf"]
@@ -1738,7 +1764,7 @@ class H(BaseHTTPRequestHandler):
                 "<a class=btn href='/bot/" + bid + "/log'>Full log</a><a class=btn href='/bot/" + bid + "'>Refresh</a></div>"
                 "<pre class=log>" + logs + "</pre>"
                 "<div style='margin-top:18px'><a class=btn href='/'>← Dashboard</a></div>")
-        self.send_html(200, layout(s, "TURBO CHANNEL · " + m.get("name", ""), body, "dash", refresh))
+        self.send_html(200, layout(s, "TURBO VPS PANEL · " + m.get("name", ""), body, "dash", refresh))
 
     def log_page(self, s, m, bid):
         label, _ = state_of(m)
@@ -1747,7 +1773,7 @@ class H(BaseHTTPRequestHandler):
                 "<div class=acts style='margin:14px 0'><a class=btn href='/bot/" + bid + "'>← Back</a>"
                 "<a class=btn href='/bot/" + bid + "/log'>Refresh</a></div>"
                 "<pre class=log>" + colorize(tail(os.path.join(bdir(bid), "bot.log"), 300)) + "</pre>")
-        self.send_html(200, layout(s, "TURBO CHANNEL · Logs", body, "dash", refresh))
+        self.send_html(200, layout(s, "TURBO VPS PANEL · Logs", body, "dash", refresh))
 
     def account_page(self, s):
         rec = users_load().get(s["user"], {})
@@ -1769,7 +1795,7 @@ class H(BaseHTTPRequestHandler):
                        "<label class=chk><input type=checkbox name=confirm value=yes required> I understand my current key will stop working</label>"
                        "<button class='btn pri wide'>Generate new key</button></form>")
         body = head + "<div class=sec>My access key</div><div class=card>" + key_box + "</div>"
-        self.send_html(200, layout(s, "TURBO CHANNEL · Account", body, "acct"))
+        self.send_html(200, layout(s, "TURBO VPS PANEL · Account", body, "acct"))
 
     def users_page(self, s):
         users = users_load()
@@ -1793,7 +1819,7 @@ class H(BaseHTTPRequestHandler):
                 + str(COIN_PER_DAY) + " coin = 1 day</div></div>"
                 + reveal_box(s) + "<div class=sec>Accounts</div><div class=ugrid>" + cards + "</div>"
                 "<div class=sec>New account</div>" + create)
-        self.send_html(200, layout(s, "TURBO CHANNEL · Users", body, "users"))
+        self.send_html(200, layout(s, "TURBO VPS PANEL · Users", body, "users"))
 
     # ----- actions -----
     def do_upload(self, s, f, files):
@@ -2090,7 +2116,7 @@ def cli_bot_status():
 # =====================================================
 def main():
     if sys.version_info < (3, 10):
-        sys.exit("TURBO CHANNEL needs Python 3.10 or newer")
+        sys.exit("TURBO VPS PANEL needs Python 3.10 or newer")
     a = sys.argv
     cmd = a[1] if len(a) > 1 else ""
     if cmd in ("--set-password", "--new-key") and len(a) == 3:
@@ -2147,7 +2173,7 @@ def main():
     print("Telegram bot runs as separate service: tb-bot", flush=True)
 
     threading.Thread(target=watchdog, daemon=True).start()
-    print("TURBO CHANNEL V %s · Userbot Web Panel · http://127.0.0.1:%d" % (VERSION, PORT), flush=True)
+    print("TURBO VPS PANEL V %s · Userbot Web Panel · http://127.0.0.1:%d" % (VERSION, PORT), flush=True)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     try:
         srv.serve_forever()
