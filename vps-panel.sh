@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =====================================================
-#  TURBO CHANNEL - VPS management menu + Web Panel (app.py V 2.2)
-#  Developer: TURBO   ·   Telegram: https://t.me/arsar2027
+#  TURBO CHANNEL - VPS management menu + Web Panel + Telegram Bot
+#  V 3.5 · Developer: TURBO · Telegram: https://t.me/arsar2027
 #  Supports: Ubuntu / Debian
 #
 #  Run with:
@@ -12,7 +12,7 @@
 
 set -u
 
-TBP_VERSION="3.2"
+TBP_VERSION="3.5"
 
 # ---------- Theme ----------
 if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
@@ -128,7 +128,7 @@ header() {
   echo -e "  ${CYAN}●${NC} ${GREY}IP  ${NC}  ${BOLD}${PUBIP}${NC}"
   echo -e "  ${CYAN}●${NC} ${GREY}OS  ${NC}  ${os}"
   echo -e "  ${CYAN}●${NC} ${GREY}Up  ${NC}  $(uptime -p | sed 's/^up //') · RAM ${ram:-?}"
-  echo -e "  $(chip Panel "$(tbp_state)")   $(chip Tunnel "$(cf_state)")"
+  echo -e "  $(chip Panel "$(tbp_state)")   $(chip Bot "$(tbp_bot_state)")   $(chip Tunnel "$(cf_state)")"
   rule
 }
 
@@ -389,12 +389,10 @@ do_reboot() {
   [[ $a == yes ]] && reboot
 }
 
-# ---------- 13. Cloudflare Tunnel ----------
+# =====================================================
+#  Shared helpers
+# =====================================================
 TBP_SECRETS_DIR=/etc/tbp
-CF_ENV=$TBP_SECRETS_DIR/env          # TUNNEL_TOKEN lives ONLY here (chmod 600, root)
-CF_SVC=cloudflared-tbp
-CF_UNIT=/etc/systemd/system/${CF_SVC}.service
-CF_LOG=/var/log/cloudflared-tbp.log
 LEGACY_CF_DIR=/etc/cloudflared-panel
 
 # Run a command fully detached from this terminal (keeps running after you close it).
@@ -409,22 +407,17 @@ detach_run() {
 
 # systemd is missing in most containers (Railway, Docker, Jupyter, etc.)
 have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; }
+
+# =====================================================
+#  13. Cloudflare Tunnel
+# =====================================================
+CF_ENV=$TBP_SECRETS_DIR/env          # TUNNEL_TOKEN lives ONLY here (chmod 600, root)
+CF_SVC=cloudflared-tbp
+CF_UNIT=/etc/systemd/system/${CF_SVC}.service
+CF_LOG=/var/log/cloudflared-tbp.log
+
 cf_installed() { command -v cloudflared >/dev/null 2>&1; }
 cf_running()   { pgrep -x cloudflared >/dev/null 2>&1; }
-
-# Read / write the token file without ever echoing it.
-cf_token_get() {
-  [[ -f $CF_ENV ]] || return 1
-  sed -n 's/^TUNNEL_TOKEN=//p' "$CF_ENV" | head -n1
-}
-
-cf_token_save() {
-  local t=$1
-  mkdir -p "$TBP_SECRETS_DIR"; chmod 700 "$TBP_SECRETS_DIR"
-  ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$t" > "$CF_ENV" )
-  chmod 600 "$CF_ENV"
-  rm -rf "$LEGACY_CF_DIR"          # remove the token file from older versions
-}
 
 cf_state() {
   if have_systemd; then
@@ -438,6 +431,19 @@ cf_state() {
   else
     echo inactive
   fi
+}
+
+cf_token_get() {
+  [[ -f $CF_ENV ]] || return 1
+  sed -n 's/^TUNNEL_TOKEN=//p' "$CF_ENV" | head -n1
+}
+
+cf_token_save() {
+  local t=$1
+  mkdir -p "$TBP_SECRETS_DIR"; chmod 700 "$TBP_SECRETS_DIR"
+  ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$t" > "$CF_ENV" )
+  chmod 600 "$CF_ENV"
+  rm -rf "$LEGACY_CF_DIR"
 }
 
 cf_install() {
@@ -623,15 +629,22 @@ cf_menu() {
   done
 }
 
-# ---------- 14. Web Panel (app.py) ----------
+# =====================================================
+#  14. Web Panel (app.py) + Telegram Bot (tbp_bot.py)
+# =====================================================
 TBP_DIR=/opt/tb-panel
 TBP_APP=$TBP_DIR/app.py
 TBP_CONF=$TBP_DIR/config.json
 TBP_SVC=tb-panel
 TBP_LOG=/var/log/tb-panel.log
 TBP_PORT=8787
-# Override with: TBP_URL=... sudo -E bash vps-panel.sh
 TBP_URL="${TBP_URL:-https://raw.githubusercontent.com/Turbospeed1963/vps-panel/main/app.py}"
+
+TBP_BOT_FILE=$TBP_DIR/tbp_bot.py
+TBP_BOT_SVC=tb-bot
+TBP_BOT_LOG=/var/log/tb-bot.log
+TBP_BOT_URL="${TBP_BOT_URL:-https://raw.githubusercontent.com/Turbospeed1963/vps-panel/main/tbp_bot.py}"
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
 
 tbp_installed() { [[ -f $TBP_APP ]]; }
@@ -640,6 +653,16 @@ tbp_state() {
   if have_systemd; then
     systemctl is-active "$TBP_SVC" 2>/dev/null || true
   elif pgrep -f "python3 $TBP_APP" >/dev/null 2>&1; then
+    echo active
+  else
+    echo inactive
+  fi
+}
+
+tbp_bot_state() {
+  if have_systemd; then
+    systemctl is-active "$TBP_BOT_SVC" 2>/dev/null || true
+  elif pgrep -f "python3 $TBP_BOT_FILE" >/dev/null 2>&1; then
     echo active
   else
     echo inactive
@@ -656,23 +679,27 @@ tbp_stop_old() {
   pkill -f "python3 /opt/vps-webpanel/app.py" 2>/dev/null || true
 }
 
-tbp_fetch_app() {
+# Downloads (or copies next to this script) a file from GitHub and checks its marker.
+# usage: tbp_fetch_file <source-name> <url> <dest> <marker-regex> <label>
+tbp_fetch_file() {
+  local name=$1 url=$2 dest=$3 marker=$4 label=$5
   mkdir -p "$TBP_DIR"; chmod 700 "$TBP_DIR"
   local tmp; tmp=$(mktemp)
-  if [[ -n $SCRIPT_DIR && -f $SCRIPT_DIR/app.py ]]; then
-    cp "$SCRIPT_DIR/app.py" "$tmp"; info "Using app.py next to this script"
-  elif ! curl -fsSL --max-time 30 "$TBP_URL" -o "$tmp"; then
-    err "Could not download app.py from GitHub"
-    info "URL: $TBP_URL"
-    rm -f "$tmp"; return 1
+  if [[ -n ${SCRIPT_DIR:-} && -f $SCRIPT_DIR/$name ]]; then
+    cp "$SCRIPT_DIR/$name" "$tmp"; info "Using $name next to this script"
+  elif ! curl -fsSL --max-time 30 "$url" -o "$tmp"; then
+    err "Could not download $label from GitHub"; info "URL: $url"; rm -f "$tmp"; return 1
   fi
-  if ! grep -q 'Userbot Web Panel' "$tmp" || \
+  if ! grep -q "$marker" "$tmp" || \
      ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$tmp" 2>/dev/null; then
-    err "Downloaded app.py is invalid"; rm -f "$tmp"; return 1
+    err "Downloaded $label is invalid"; rm -f "$tmp"; return 1
   fi
-  install -m 600 "$tmp" "$TBP_APP"; rm -f "$tmp"
-  ok "app.py installed to $TBP_APP"
+  install -m 600 "$tmp" "$dest"; rm -f "$tmp"
+  ok "$label installed"
 }
+
+tbp_fetch_app() { tbp_fetch_file app.py "$TBP_URL" "$TBP_APP" 'Userbot Web Panel\|TURBO CHANNEL' "app.py"; }
+tbp_fetch_bot() { tbp_fetch_file tbp_bot.py "$TBP_BOT_URL" "$TBP_BOT_FILE" 'TURBO CHANNEL - Telegram Bot' "tbp_bot.py"; }
 
 # Creates (or re-issues) an admin access key. app.py prints the key once.
 tbp_set_password() {
@@ -762,6 +789,112 @@ tbp_logs() {
   fi
 }
 
+# ---------- Telegram bot service ----------
+tbp_bot_write_unit() {
+  cat > /etc/systemd/system/$TBP_BOT_SVC.service <<EOF
+[Unit]
+Description=TURBO CHANNEL Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=TBP_CONF=$TBP_CONF
+Environment=TBP_PORT=$TBP_PORT
+ExecStart=$(command -v python3) $TBP_BOT_FILE
+WorkingDirectory=$TBP_DIR
+Restart=always
+RestartSec=5
+# exit 3 = config problem (no token / rejected token) -> do not restart-loop
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+tbp_bot_start() {
+  [[ -f $TBP_BOT_FILE ]] || { err "tbp_bot.py missing - run menu 14 → 1 first"; return 1; }
+  if have_systemd; then
+    tbp_bot_write_unit
+    systemctl enable "$TBP_BOT_SVC" >/dev/null 2>&1
+    systemctl restart "$TBP_BOT_SVC"
+    sleep 3
+    if systemctl is-active --quiet "$TBP_BOT_SVC"; then
+      ok "Telegram bot running (tb-bot)"
+    else
+      err "Bot not running - check menu 14 → 9 → 6"
+    fi
+  else
+    pkill -f "python3 $TBP_BOT_FILE" 2>/dev/null; sleep 1
+    detach_run "$TBP_BOT_LOG" env TBP_CONF="$TBP_CONF" TBP_PORT="$TBP_PORT" python3 "$TBP_BOT_FILE"
+    sleep 3
+    if pgrep -f "python3 $TBP_BOT_FILE" >/dev/null 2>&1; then
+      ok "Telegram bot running (background)"
+    else
+      err "Bot not running"; tail -n 8 "$TBP_BOT_LOG" 2>/dev/null
+    fi
+  fi
+}
+
+tbp_bot_stop() {
+  if have_systemd; then
+    systemctl stop "$TBP_BOT_SVC" 2>/dev/null
+  else
+    pkill -f "python3 $TBP_BOT_FILE" 2>/dev/null
+  fi
+}
+
+tbp_bot_logs() {
+  if have_systemd; then
+    journalctl -u "$TBP_BOT_SVC" -n 60 --no-pager 2>/dev/null
+  else
+    tail -n 60 "$TBP_BOT_LOG" 2>/dev/null || echo "  (no log yet)"
+  fi
+}
+
+tbp_bot_settings() {
+  header
+  title "Telegram Bot Settings (tb-bot)"
+  if ! tbp_installed; then err "Install the web panel first"; pause; return; fi
+  opt 1 "Set bot token (from @BotFather)"
+  opt 2 "Add bot admin (Telegram ID)"
+  opt 3 "Set channel (e.g. @arsar2027)"
+  opt 4 "Set panel URL (https://...)"
+  opt 5 "Referral reward (coins per invite)"
+  opt 6 "Show bot logs"
+  opt 7 "Restart bot"
+  opt 8 "Stop bot"
+  opt 0 "Back"
+  echo
+  read -rp "$PROMPT" c
+  case $c in
+    1) read -rsp "  Bot token: " t; echo
+       if printf '%s' "$t" | TBP_HOME=$TBP_DIR python3 "$TBP_APP" --bot-token; then
+         tbp_fetch_bot && tbp_bot_start
+       fi
+       unset t; pause ;;
+    2) read -rp "  Telegram ID: " id
+       TBP_HOME=$TBP_DIR python3 "$TBP_APP" --bot-admin "$id" && tbp_bot_start
+       pause ;;
+    3) read -rp "  Channel (@username): " ch
+       TBP_HOME=$TBP_DIR python3 "$TBP_APP" --bot-channel "$ch" && tbp_bot_start
+       pause ;;
+    4) read -rp "  Panel URL: " pu
+       TBP_HOME=$TBP_DIR python3 "$TBP_APP" --panel-url "$pu" && tbp_bot_start
+       pause ;;
+    5) read -rp "  Coins per invite (0-100): " rr
+       TBP_HOME=$TBP_DIR python3 "$TBP_APP" --ref-reward "$rr" && tbp_bot_start
+       pause ;;
+    6) tbp_bot_logs; pause ;;
+    7) tbp_bot_start; pause ;;
+    8) tbp_bot_stop; ok "Bot stopped"; pause ;;
+    0) return ;;
+    *) err "Invalid choice"; sleep 1 ;;
+  esac
+}
+
+# ---------- Install / uninstall ----------
 tbp_install() {
   header
   title "Web Panel (app.py) · Install"
@@ -786,6 +919,13 @@ tbp_install() {
 
   tbp_start || { pause; return; }
 
+  tbp_fetch_bot || true
+  if grep -q '"token"' "$TBP_CONF" 2>/dev/null; then
+    tbp_bot_start
+  else
+    info "Telegram bot token မသတ်မှတ်သေးပါ — menu 14 → 9 → 1 နဲ့ ထည့်ပါ"
+  fi
+
   echo
   read -rp "  Connect Cloudflare Tunnel now? [y/N]: " a
   if [[ $a =~ ^[Yy] ]]; then cf_connect; fi
@@ -795,50 +935,54 @@ tbp_install() {
 }
 
 tbp_uninstall() {
-  read -rp "  Remove web panel, bots and config? (yes/no): " a
+  read -rp "  Remove web panel, bot, bots and config? (yes/no): " a
   [[ $a == yes ]] || return
   tbp_stop
-  local p
+  tbp_bot_stop
+  local p u
   for p in $(pgrep -f 'bot\.(py|js)$' 2>/dev/null); do
     case $(readlink "/proc/$p/cwd" 2>/dev/null) in
       "$TBP_DIR"/bots/*) kill "$p" 2>/dev/null ;;
     esac
   done
-  # remove per-bot OS users (tbpb_<id>)
-  local u
   for u in $(getent passwd | cut -d: -f1 | grep '^tbpb_' || true); do
     userdel "$u" >/dev/null 2>&1
   done
   if have_systemd; then
-    systemctl disable "$TBP_SVC" 2>/dev/null
-    rm -f /etc/systemd/system/$TBP_SVC.service
+    systemctl disable "$TBP_SVC" "$TBP_BOT_SVC" 2>/dev/null
+    rm -f /etc/systemd/system/$TBP_SVC.service /etc/systemd/system/$TBP_BOT_SVC.service
     systemctl daemon-reload
   fi
-  rm -rf "$TBP_DIR" "$TBP_LOG"
+  rm -rf "$TBP_DIR" "$TBP_LOG" "$TBP_BOT_LOG"
   ok "Removed. Also delete the hostname in the Cloudflare Dashboard."
 }
 
 wp_menu() {
   while true; do
     header
-    title "TURBO CHANNEL · Web Panel (app.py)"
+    title "TURBO CHANNEL · Web Panel + Bot"
     if tbp_installed; then
       local st
       st=$(tbp_state)
       if [[ $st == active ]]; then st="${GREEN}running${NC}"; else st="${RED}${st}${NC}"; fi
-      echo -e "  Status: $st   ${GREY}http://127.0.0.1:$TBP_PORT${NC}"
+      echo -e "  Panel : $st   ${GREY}http://127.0.0.1:$TBP_PORT${NC}"
+      local bs
+      bs=$(tbp_bot_state)
+      if [[ $bs == active ]]; then bs="${GREEN}running${NC}"; else bs="${YELLOW}${bs}${NC}"; fi
+      echo -e "  Bot   : $bs"
     else
       echo -e "  Status: ${YELLOW}not installed${NC}"
     fi
     echo
     opt 1 "Install / update web panel"
     opt 2 "Issue new admin key"
-    opt 3 "Restart"
-    opt 4 "Stop"
-    opt 5 "Show status"
-    opt 6 "Show logs"
+    opt 3 "Restart web panel"
+    opt 4 "Stop web panel"
+    opt 5 "Show panel status"
+    opt 6 "Show panel logs"
     opt 7 "Cloudflare Tunnel (token)"
-    opt 8 "Uninstall"
+    opt 8 "Uninstall everything"
+    opt 9 "Telegram bot settings (token, admin, channel)"
     opt 0 "Back"
     echo
     read -rp "$PROMPT" c
@@ -851,6 +995,7 @@ wp_menu() {
       6) tbp_logs; pause ;;
       7) cf_menu ;;
       8) tbp_uninstall; pause ;;
+      9) tbp_bot_settings ;;
       0) return ;;
       *) err "Invalid choice"; sleep 1 ;;
     esac
@@ -860,7 +1005,7 @@ wp_menu() {
 # ---------- Main menu ----------
 MENU=(
   "System Info" "System Update" "Basic Tools" "Firewall (UFW)" "SSH & Users" "Nginx + SSL" "Docker Install"
-  "Swap Setup" "Backup" "Monitor" "Network Check" "Reboot" "Cloudflare Tunnel" "Web Panel (app.py)"
+  "Swap Setup" "Backup" "Monitor" "Network Check" "Reboot" "Cloudflare Tunnel" "Web Panel + Bot"
 )
 
 print_menu() {
