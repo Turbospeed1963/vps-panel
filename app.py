@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 # =====================================================
-#  TURBO CHANNEL - Userbot Web Panel  ·  V 2.2
+#  TURBO CHANNEL - Userbot Web Panel · V 2.6
 #  Developer: TURBO   ·   Telegram: https://t.me/arsar2027
 #
-#  - Access-key login (no passwords). Admin issues keys, shown once.
-#  - Users see ONLY their own bots, logs and files. Admin sees everything.
-#  - Per-user quota: RAM 256 MB · CPU 0.5 core · Disk 1024 MB
-#      HARD via cgroup v2 (memory.max / cpu.max) when the host allows it,
-#      otherwise SOFT (RSS watchdog + disk checks + rlimits).
-#  - Every bot runs as its own unprivileged OS user (tbpb_<id>).
-#  - Code scanner blocks bot-hosting, server-control and malware code.
-#    3 violations = automatic account ban (admin can re-enable).
-#  - POLICY: opencv-python*, numpy, ddddocr are NEVER installed.
+#  - Access-key login (no passwords). Admin issues keys; shown once.
+#  - Coins: 2 coin = 1 day · keys carry an expiry · renew with coins
+#  - Users see only their own bots, logs and files; admin sees everything
+#  - Quota per user: RAM 256 MB · CPU 0.5 core · Disk 1024 MB
+#      HARD via cgroup v2 when available, otherwise SOFT (watchdog)
+#  - Every bot runs as its own OS user (tbpb_<id>)
+#  - Scanner: 3 hosting/malware violations = automatic ban
+#  - Telegram bot lives in tbp_bot.py (separate process). This app only
+#    exposes a LOCAL /internal API, protected by a shared secret.
+#  - POLICY: opencv-python*, numpy, ddddocr are NEVER installed
 #  Listens on 127.0.0.1 only. Publish via Cloudflare Tunnel.
-#  Admin key:  sudo python3 app.py --set-password admin
-#  Run:        sudo python3 app.py   ->  http://127.0.0.1:8787
+#
+#  CLI:
+#    sudo python3 app.py --set-password admin        # admin key (shown once)
+#    echo "<TOKEN>" | sudo python3 app.py --bot-token  # stored in config.json
+#    sudo python3 app.py --bot-admin <tg_id>
+#    sudo python3 app.py --bot-channel @arsar2027
+#    sudo python3 app.py --panel-url https://panel.example.com
+#    sudo python3 app.py --ref-reward 2
+#    sudo python3 app.py --bot-status
+#    sudo python3 app.py                             # run panel
 # =====================================================
-import ast, hashlib, hmac, html, json, os, pwd, re, resource, secrets, shutil, signal, subprocess, sys, threading, time, traceback
+import ast, getpass, hashlib, hmac, html, json, os, pwd, re, resource, secrets, shutil, signal, subprocess, sys, threading, time, traceback
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.2"
+VERSION = "2.6"
 PANEL_NAME = "TURBO CHANNEL"
 DEVELOPER = "TURBO"
 TG_HANDLE = "@arsar2027"
@@ -32,6 +41,10 @@ CONF = os.path.join(HOME, "config.json")
 BOTS = os.path.join(HOME, "bots")
 PORT = int(os.environ.get("TBP_PORT", "8787"))
 MB = 1024 * 1024
+DAY = 86400
+COIN_PER_DAY = 2
+DAY_OPTIONS = (1, 3, 7)
+KEY_COOLDOWN = DAY              # non-admin users: one key issue per 24 h
 QUOTA_RAM_MB = 256
 QUOTA_CPU = 0.5
 QUOTA_DISK_MB = 1024
@@ -71,6 +84,8 @@ PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 BID_RE = r"[0-9a-f]{12}"
 NAME_RE = re.compile(r"[a-z0-9_.-]{3,32}")
 KEY_RE = re.compile(r"tbp_([0-9a-f]{8})\.([A-Za-z0-9_-]{40,64})")
+TOKEN_RE = re.compile(r"\d{5,12}:[A-Za-z0-9_-]{30,60}")
+CHANNEL_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{4,}")
 
 # ---- code scanner rules: (category, regex), checked line by line ----
 RULES = [
@@ -163,8 +178,58 @@ def _write(p, s):
 
 
 # =====================================================
-#  Access keys / accounts
+#  Config, accounts, keys, coins
 # =====================================================
+def conf_load():
+    return read_json(CONF, {})
+
+
+def users_load():
+    conf = conf_load()
+    users = conf.get("users")
+    if isinstance(users, dict):
+        return users
+    if conf.get("user"):
+        return {conf["user"]: new_record("admin")}
+    return {}
+
+
+def users_mutate(fn):
+    """Atomic read-modify-write of config.json (users + bot settings live together)."""
+    with LOCK:
+        conf = conf_load()
+        users = conf.get("users")
+        if not isinstance(users, dict):
+            users = users_load()
+        res = fn(users)
+        conf["users"] = users
+        write_json(CONF, conf)
+        return res
+
+
+def bot_cfg():
+    b = conf_load().get("bot")
+    return b if isinstance(b, dict) else {}
+
+
+def bot_cfg_update(**kw):
+    with LOCK:
+        conf = conf_load()
+        b = conf.get("bot") if isinstance(conf.get("bot"), dict) else {}
+        for k, v in kw.items():
+            if v is None:
+                b.pop(k, None)
+            else:
+                b[k] = v
+        conf["bot"] = b
+        write_json(CONF, conf)
+
+
+def ensure_internal_secret():
+    if not bot_cfg().get("internal_secret"):
+        bot_cfg_update(internal_secret=secrets.token_urlsafe(32))
+
+
 def key_digest(secret):
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
@@ -174,7 +239,7 @@ def issue_key(rec):
     secret = secrets.token_urlsafe(32)
     rec.pop("salt", None)
     rec.pop("hash", None)
-    rec.update(key_id=kid, key_hash=key_digest(secret))
+    rec.update(key_id=kid, key_hash=key_digest(secret), key_issued_at=time.time())
     return "tbp_%s.%s" % (kid, secret)
 
 
@@ -194,27 +259,27 @@ def has_key(rec):
     return bool(rec.get("key_id") and rec.get("key_hash"))
 
 
+def key_wait_left(rec):
+    """Seconds left before a non-admin user may issue a new key. 0 = allowed now."""
+    if rec.get("role") == "admin":
+        return 0
+    last = float(rec.get("key_issued_at") or 0)
+    return max(0, int(last + KEY_COOLDOWN - time.time()))
+
+
+def fmt_wait(sec):
+    mins = max(1, (int(sec) + 59) // 60)
+    h, m = divmod(mins, 60)
+    return "%dh %dm" % (h, m) if h else "%d min" % m
+
+
 def new_record(role):
-    return {"role": role, "disabled": False, "created": time.time(), "strikes": 0}
+    return {"role": role, "disabled": False, "created": time.time(), "strikes": 0,
+            "coins": 0, "expires": 0, "refs": 0}
 
 
 def valid_name(n):
     return bool(NAME_RE.fullmatch(n))
-
-
-def users_load():
-    with LOCK:
-        conf = read_json(CONF, {})
-        users = conf.get("users")
-        if isinstance(users, dict):
-            return users
-        if conf.get("user"):
-            return {conf["user"]: new_record("admin")}
-        return {}
-
-
-def users_save(users):
-    write_json(CONF, {"users": users})
 
 
 def active_admins(users):
@@ -225,9 +290,25 @@ def owner_role(owner):
     return users_load().get(owner, {}).get("role", "user")
 
 
+def is_expired(rec):
+    if rec.get("role") == "admin":
+        return False
+    exp = float(rec.get("expires") or 0)
+    return exp > 0 and exp < time.time()
+
+
+def time_left_text(rec):
+    exp = float(rec.get("expires") or 0)
+    if exp <= 0:
+        return "not started"
+    left = exp - time.time()
+    if left <= 0:
+        return "expired on " + fmt_time(exp)
+    return "%dd %dh left (until %s)" % (int(left // DAY), int((left % DAY) // 3600), fmt_time(exp))
+
+
 def add_strike(name):
-    with LOCK:
-        users = users_load()
+    def fn(users):
         rec = users.get(name)
         if not rec:
             return 0, False
@@ -236,8 +317,8 @@ def add_strike(name):
         if rec["strikes"] >= STRIKE_LIMIT and rec.get("role") != "admin" and not rec.get("disabled"):
             rec["disabled"] = True
             banned = True
-        users_save(users)
-        strikes = rec["strikes"]
+        return rec["strikes"], banned
+    strikes, banned = users_mutate(fn)
     if banned:
         for m in list_bots(owner=name):
             stop_bot(m["id"])
@@ -245,22 +326,157 @@ def add_strike(name):
     return strikes, banned
 
 
-def cli_new_key(name):
-    name = name.strip().lower()
-    if not valid_name(name):
-        sys.exit("Invalid username (3-32 chars: a-z, 0-9, _ . -)")
-    with LOCK:
-        users = users_load()
-        if name not in users:
-            users[name] = new_record("admin")
-        rec = users[name]
-        rec["disabled"] = False
-        key = issue_key(rec)
-        users_save(users)
-    print("")
-    print("Access key for '%s' (role: %s) - shown ONCE, save it now:" % (name, rec.get("role")))
-    print(key)
-    print("")
+def add_coins(name, amount):
+    def fn(users):
+        rec = users.get(name)
+        if not rec:
+            return None
+        rec["coins"] = max(0, int(rec.get("coins", 0)) + amount)
+        return rec["coins"]
+    return users_mutate(fn)
+
+
+def tg_account(uid, ref=None):
+    """Creates the panel account for a Telegram user (name: tg<id>) if missing.
+    `ref` is the inviter's Telegram ID, only used for brand-new accounts."""
+    name = "tg%d" % int(uid)
+
+    def fn(users):
+        if name in users:
+            return
+        rec = new_record("user")
+        rec.update(tg_id=int(uid))
+        if ref:
+            rr = "tg%d" % int(ref)
+            if rr != name and rr in users:
+                rec["ref_by"] = rr
+        users[name] = rec
+    users_mutate(fn)
+    return name
+
+
+def ref_reward():
+    try:
+        return max(0, min(100, int(bot_cfg().get("ref_reward", COIN_PER_DAY))))
+    except (TypeError, ValueError):
+        return COIN_PER_DAY
+
+
+def apply_reward(name):
+    """Pays the inviter once. Returns inviter's Telegram ID when paid, else None."""
+    amount = ref_reward()
+
+    def fn(users):
+        r = users.get(name)
+        if amount <= 0 or not r or not r.get("ref_by") or r.get("ref_done"):
+            return None
+        r["ref_done"] = True
+        inv = users.get(r["ref_by"])
+        if not inv or inv.get("disabled"):
+            return None
+        inv["coins"] = int(inv.get("coins", 0)) + amount
+        inv["refs"] = int(inv.get("refs", 0)) + 1
+        return inv.get("tg_id")
+    return users_mutate(fn)
+
+
+def purchase(name, days):
+    """Spends coins for `days`, extends expiry, issues a key on first purchase.
+    Returns (status, message, key_or_None)."""
+    now = time.time()
+
+    def fn(users):
+        rec = users.get(name)
+        if not rec:
+            return "bad", "Account not found - press /start first", None
+        if rec.get("disabled"):
+            return "bad", "Account is banned - contact the admin", None
+        cost = days * COIN_PER_DAY
+        coins = int(rec.get("coins", 0))
+        if coins < cost:
+            return "bad", "Not enough coins: %d needed, you have %d." % (cost, coins), None
+        base = max(float(rec.get("expires") or 0), now)
+        rec["coins"] = coins - cost
+        rec["expires"] = base + days * DAY
+        key = None
+        if not has_key(rec):
+            key = issue_key(rec)
+        return ("ok", "Added %d day(s). Coins left: %d · expires %s"
+                % (days, rec["coins"], fmt_time(rec["expires"])), key)
+    return users_mutate(fn)
+
+
+def reissue(name):
+    def fn(users):
+        rec = users.get(name)
+        if not rec or rec.get("disabled"):
+            return "bad", "Account unavailable", None
+        if float(rec.get("expires") or 0) <= time.time():
+            return "bad", "No active time. Buy days first.", None
+        wait = key_wait_left(rec)
+        if wait > 0:
+            return "bad", "Key can be issued once per day. Try again in %s." % fmt_wait(wait), None
+        return "ok", "New key issued. The old key no longer works.", issue_key(rec)
+    return users_mutate(fn)
+
+
+def public_info(name):
+    rec = users_load().get(name, {})
+    return {"coins": int(rec.get("coins", 0)), "time_left": time_left_text(rec),
+            "has_key": has_key(rec), "disabled": bool(rec.get("disabled")),
+            "strikes": int(rec.get("strikes", 0)), "refs": int(rec.get("refs", 0)),
+            "wait_left": key_wait_left(rec), "expires": float(rec.get("expires") or 0)}
+
+
+def internal_dispatch(path, body):
+    """Only reachable through H.internal_api (local + shared secret checked)."""
+    if path == "/internal/meta":
+        un = str(body.get("username") or "")
+        if re.fullmatch(r"[A-Za-z0-9_]{3,64}", un):
+            bot_cfg_update(username=un)
+            return {"ok": True}
+        return {"ok": False, "error": "bad username"}
+    try:
+        tg = int(body.get("tg_id"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "tg_id required"}
+    name = "tg%d" % tg
+    if path == "/internal/user":
+        ref = body.get("ref")
+        ref = int(ref) if str(ref or "").isdigit() else None
+        tg_account(tg, ref)
+        return {"ok": True, "user": public_info(name)}
+    if path == "/internal/info":
+        return {"ok": True, "user": public_info(name) if name in users_load() else None}
+    if path == "/internal/buy":
+        try:
+            days = int(body.get("days"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "days required"}
+        if days not in DAY_OPTIONS:
+            return {"ok": False, "error": "invalid days"}
+        status, msg, key = purchase(name, days)
+        if status == "ok" and key:
+            kill_sessions(name)
+        return {"ok": status == "ok", "msg": msg, "key": key}
+    if path == "/internal/reissue":
+        status, msg, key = reissue(name)
+        if status == "ok":
+            kill_sessions(name)
+        return {"ok": status == "ok", "msg": msg, "key": key}
+    if path == "/internal/reward":
+        return {"ok": True, "inviter_tg": apply_reward(name), "amount": ref_reward()}
+    if path == "/internal/addcoin":
+        try:
+            amount = int(body.get("amount"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "amount required"}
+        if amount == 0 or abs(amount) > 100000:
+            return {"ok": False, "error": "bad amount"}
+        if name not in users_load():
+            return {"ok": False, "error": "account not found"}
+        return {"ok": True, "coins": add_coins(name, amount)}
+    return {"ok": False, "error": "unknown endpoint"}
 
 
 def stats():
@@ -363,7 +579,7 @@ def _chown(p, uid, gid):
 
 def harden(bid):
     """Root owns the bot folder and secrets; the bot's own user can only read its
-    source and write its work/ folder. Other bots' users cannot enter this folder."""
+    source and write its work/ folder."""
     d = bdir(bid)
     m = meta_load(bid)
     pw = bot_pw(bid)
@@ -438,8 +654,6 @@ def cg_ready_host():
 
 
 def cg_setup(owner):
-    """Creates a per-user cgroup v2 with memory.max=256M and cpu.max=0.5 core.
-    Returns the directory, or None when the host does not support it (soft mode)."""
     if not cg_ready_host():
         return None
     try:
@@ -471,23 +685,43 @@ def owner_ram_used(owner):
     return total
 
 
+def tile(label, value, p=None, sub=""):
+    bar = ""
+    if p is not None:
+        bar = "<div class=bar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
+    return ("<div class=tile><div class=tl>%s</div><div class=tv>%s</div>%s<div class=ts>%s</div></div>"
+            % (esc(label), esc(value), bar, esc(sub)))
+
+
 def quota_tiles(owner):
     ram = owner_ram_used(owner)
     disk = user_disk(owner)
     mode = "HARD · cgroup v2" if hard_mode(owner) else "SOFT · watchdog"
-    return ("<div class=grid>"
-            + tile("RAM quota", "%s / %d MB" % (human(ram), QUOTA_RAM_MB), pct(ram, QUOTA_RAM_MB * MB), mode)
+    return (tile("RAM quota", "%s / %d MB" % (human(ram), QUOTA_RAM_MB), pct(ram, QUOTA_RAM_MB * MB), mode)
             + tile("CPU quota", "%.1f core" % QUOTA_CPU, None, "%d%% of one core" % int(QUOTA_CPU * 100))
             + tile("Disk quota", "%s / %d MB" % (human(disk), QUOTA_DISK_MB), pct(disk, QUOTA_DISK_MB * MB),
-                   "bots · venv · packages")
-            + "</div>")
+                   "bots · venv · packages"))
+
+
+def sub_tiles(rec):
+    exp = float(rec.get("expires") or 0)
+    now = time.time()
+    if exp <= 0:
+        val, sub = "Not started", "buy days in Telegram"
+    elif exp <= now:
+        val, sub = "Expired", "renew in Telegram"
+    else:
+        left = exp - now
+        val = "%dd %dh" % (int(left // DAY), int((left % DAY) // 3600))
+        sub = "until " + fmt_time(exp)
+    return (tile("Time left", val, None, sub)
+            + tile("Coins", str(int(rec.get("coins", 0))), None, "%d coin = 1 day" % COIN_PER_DAY))
 
 
 # =====================================================
 #  Code scanner
 # =====================================================
 def analyze(kind, src):
-    """Returns (violations, imports). Raises ValueError on Python syntax errors."""
     viol = []
     for n, line in enumerate(src.splitlines(), 1):
         for cat, rx in RULES_C:
@@ -714,8 +948,11 @@ def start_bot(bid, manual=True):
         if is_running(bid, m):
             return True, "Already running"
         owner = m.get("owner", "")
-        is_user = owner_role(owner) != "admin"
+        orec = users_load().get(owner, {})
+        is_user = orec.get("role", "user") != "admin"
         if is_user:
+            if is_expired(orec):
+                return False, "Subscription expired - buy days in the Telegram bot"
             if user_disk(owner) > QUOTA_DISK_MB * MB:
                 return False, "Disk quota exceeded (%d MB)" % QUOTA_DISK_MB
             if owner_ram_used(owner) >= QUOTA_RAM_MB * MB:
@@ -807,12 +1044,19 @@ def state_of(m):
     return "Stopped", "mut"
 
 
-def enforce_quota():
-    """Soft RAM enforcement: if a user's bots exceed 256 MB together, stop the newest one."""
+def enforce_policies():
+    users = users_load()
+    # 1) expired subscriptions: stop their bots
+    for m in list_bots():
+        rec = users.get(m.get("owner", ""), {})
+        if is_expired(rec) and is_running(m["id"], m):
+            stop_bot(m["id"])
+            meta_update(m["id"], msg="Subscription expired - buy days in the Telegram bot")
+    # 2) RAM quota: stop the newest bot of an over-quota user
     groups = {}
     for m in list_bots():
         o = m.get("owner", "")
-        if owner_role(o) != "admin":
+        if users.get(o, {}).get("role") != "admin":
             groups.setdefault(o, []).append(m)
     for owner, bots in groups.items():
         if owner_ram_used(owner) <= QUOTA_RAM_MB * MB:
@@ -829,10 +1073,13 @@ def watchdog():
     time.sleep(3)
     while True:
         try:
-            enforce_quota()
+            enforce_policies()
+            users = users_load()
             for m in list_bots():
                 bid = m["id"]
                 if m.get("status") != "ready" or not m.get("enabled"):
+                    continue
+                if is_expired(users.get(m.get("owner", ""), {})):
                     continue
                 with LOCK:
                     mm = meta_load(bid)
@@ -859,6 +1106,13 @@ def kill_sessions(name, keep=None):
 def tunnel_up():
     try:
         return subprocess.run(["pgrep", "-x", "cloudflared"], capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def bot_up():
+    try:
+        return subprocess.run(["pgrep", "-f", "tbp_bot.py"], capture_output=True, timeout=5).returncode == 0
     except Exception:
         return False
 
@@ -965,10 +1219,9 @@ h1{font-size:26px;margin:0 0 2px;letter-spacing:-.01em}
 .bar{height:7px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden;margin:10px 0 6px}
 .bar i{display:block;height:100%;border-radius:99px}
 .bots{display:grid;gap:10px}
-.botrow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 16px;border-radius:16px;background:var(--panel2);border:1px solid var(--line);transition:.15s}
+.botrow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 16px;border-radius:16px;background:var(--panel2);border:1px solid var(--line);transition:.15s;text-decoration:none}
 .botrow:hover{border-color:rgba(167,139,250,.45);transform:translateY(-1px)}
 .name{font-weight:700;font-size:16px}
-.name a{text-decoration:none}
 .kv{color:var(--mut);font-size:13px}.kv b{color:var(--txt)}
 .mut{color:var(--mut)}
 .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
@@ -984,11 +1237,12 @@ h1{font-size:26px;margin:0 0 2px;letter-spacing:-.01em}
 button,.btn{font:inherit;font-weight:600;padding:8px 14px;border-radius:11px;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--txt);cursor:pointer;text-decoration:none;display:inline-block;transition:transform .08s,filter .15s}
 button:hover,.btn:hover{filter:brightness(1.15)}
 button:active,.btn:active{transform:scale(.97)}
+button:disabled,.btn:disabled{opacity:.5;cursor:not-allowed;filter:none}
 .btn.pri{border:0;color:#0b0b1a;background:linear-gradient(90deg,var(--c1),var(--c2));box-shadow:0 6px 22px rgba(34,211,238,.25)}
 .btn.ok{background:rgba(52,211,153,.15);border-color:rgba(52,211,153,.45);color:#a7f3d0}
 .btn.dng{background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.45);color:#fecdd3}
 .btn.ghost{background:transparent}.btn.sm{padding:5px 11px;font-size:13px}.wide{width:100%}
-input[type=text],input[type=password],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt)}
+input[type=text],input[type=password],input[type=number],select{font:inherit;width:100%;padding:11px 13px;margin:5px 0 12px;border-radius:11px;border:1px solid var(--line);background:rgba(7,8,20,.8);color:var(--txt)}
 input:focus,select:focus{outline:2px solid rgba(34,211,238,.45);border-color:transparent}
 label{display:block;font-size:13px;color:var(--mut);font-weight:600}
 .mini{display:inline-flex;gap:5px;align-items:center;font-weight:500;color:var(--mut);margin-left:4px}
@@ -1022,6 +1276,18 @@ footer a{color:#7dd3fc;text-decoration:none}
 BOLT_SVG = "<svg viewBox='0 0 24 24'><path d='M13 2 4 14h6l-1 8 9-12h-6z'/></svg>"
 
 
+def bar_color(p):
+    if p < 70:
+        return "linear-gradient(90deg,#22d3ee,#a78bfa)"
+    if p < 90:
+        return "linear-gradient(90deg,#fbbf24,#f97316)"
+    return "linear-gradient(90deg,#fb7185,#f472b6)"
+
+
+def mini_bar(p):
+    return "<div class=mbar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
+
+
 def page(title, body, refresh=0):
     meta = "<meta http-equiv=refresh content='%d'>" % refresh if refresh else ""
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
@@ -1045,7 +1311,7 @@ def layout(s, title, body, active="", refresh=0):
         links.append(("users", "/users", "Users"))
     links.append(("acct", "/account", "Account"))
     nav = "".join("<a class='%s' href='%s'>%s</a>" % ("on" if k == active else "", h, t) for k, h, t in links)
-    nav += "<a class=tg href='%s' target=_blank rel=noopener>Telegram ↗</a>" % TG_URL
+    nav += "<a class=tg href='%s' target=_blank rel=noopener>Channel ↗</a>" % TG_URL
     top = ("<header class=topbar>"
            "<a class=brand href='/'><span class=badge>" + BOLT_SVG + "</span>"
            "<span><div class=bname>" + esc(PANEL_NAME) + "</div><div class=bsub>Userbot Panel</div></span></a>"
@@ -1066,31 +1332,11 @@ def reveal_box(s):
             "<code>" + esc(rv[1]) + "</code></div>")
 
 
-def bar_color(p):
-    if p < 70:
-        return "linear-gradient(90deg,#22d3ee,#a78bfa)"
-    if p < 90:
-        return "linear-gradient(90deg,#fbbf24,#f97316)"
-    return "linear-gradient(90deg,#fb7185,#f472b6)"
-
-
-def tile(label, value, p=None, sub=""):
-    bar = ""
-    if p is not None:
-        bar = "<div class=bar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
-    return ("<div class=tile><div class=tl>%s</div><div class=tv>%s</div>%s<div class=ts>%s</div></div>"
-            % (esc(label), esc(value), bar, esc(sub)))
-
-
-def mini_bar(p):
-    return "<div class=mbar><i style='width:%d%%;background:%s'></i></div>" % (p, bar_color(p))
-
-
 def bot_row(m, show_owner):
     label, cls = state_of(m)
     bid = m["id"]
     owner = (" · owner " + esc(m.get("owner", ""))) if show_owner else ""
-    return ("<a class=botrow href='/bot/%s' style='text-decoration:none'>"
+    return ("<a class=botrow href='/bot/%s'>"
             "<div><div class=name>%s</div><div class=kv>%s%s · %s</div></div>"
             "<div class=acts><span class='pill %s'>%s</span></div></a>"
             % (bid, esc(m.get("name", "")), esc(m.get("kind", "").upper()), owner, esc(m.get("msg", "")),
@@ -1127,35 +1373,49 @@ def ufm(csrf, act, user, label, cls, inner=""):
             "<button class='btn " + cls + "'>" + esc(label) + "</button></form> ")
 
 
+def coin_form(csrf, user):
+    return ("<form class=inline method=post action=/users/action>"
+            "<input type=hidden name=csrf value='" + esc(csrf) + "'>"
+            "<input type=hidden name=user value='" + esc(user) + "'>"
+            "<input type=hidden name=act value='coins'>"
+            "<input type=number name=amount value=2 min=-100000 max=100000 style='width:96px;margin:0;padding:6px 8px'>"
+            "<button class='btn sm'>Add coins</button></form> ")
+
+
 def ucard(name, r, csrf, me, nbots, ram, disk):
     is_admin = r.get("role") == "admin"
     banned = bool(r.get("disabled"))
     head = ("<div class=uhead><div><div class=name>" + esc(name) + "</div>"
             "<div class=kv>created " + fmt_time(r.get("created")) + "</div></div>"
             "<div class=acts>" + ("<span class='pill info'>admin</span>" if is_admin else "<span class='pill mut'>user</span>") +
-            ("<span class='pill bad'>banned</span>" if banned else "<span class='pill ok'>active</span>") + "</div></div>")
+            ("<span class='pill bad'>banned</span>" if banned else "<span class='pill ok'>active</span>") +
+            ("" if has_key(r) else "<span class='pill warn'>no key</span>") + "</div></div>")
+    tg = (" · tg <b>%s</b>" % esc(r["tg_id"])) if r.get("tg_id") else ""
     flags = ("<div class=kv>bots <b>%d</b> · strikes <b>%d/%d</b>%s</div>"
-             % (nbots, int(r.get("strikes", 0)), STRIKE_LIMIT,
-                "" if has_key(r) else " · <span class='tag2'>no key</span>"))
+             % (nbots, int(r.get("strikes", 0)), STRIKE_LIMIT, tg))
+    money = ("<div class=kv>🪙 <b>%d</b> coins · ⏳ %s</div>"
+             % (int(r.get("coins", 0)), esc("no expiry" if is_admin else time_left_text(r))))
     if is_admin:
-        ram_txt, disk_txt = "no limit", "no limit"
-        bars = ""
+        ram_txt, disk_txt, bars = "no limit", "no limit", ""
     else:
         ram_p, disk_p = pct(ram, QUOTA_RAM_MB * MB), pct(disk, QUOTA_DISK_MB * MB)
         ram_txt = "%s / %d MB" % (human(ram), QUOTA_RAM_MB)
         disk_txt = "%s / %d MB" % (human(disk), QUOTA_DISK_MB)
         bars = mini_bar(ram_p) + mini_bar(disk_p)
     quotas = ("<div class=ubars><div class=kv>RAM <b>%s</b> · CPU <b>%s</b></div>%s"
-              "<div class=kv>Disk <b>%s</b></div></div>" % (ram_txt, "0.5 core" if not is_admin else "no limit", bars, disk_txt))
+              "<div class=kv>Disk <b>%s</b></div></div>"
+              % (ram_txt, "no limit" if is_admin else "0.5 core", bars, disk_txt))
     if me:
         acts = "<span class=kv>(you — use Account page)</span>"
     else:
-        acts = ufm(csrf, "reset", name, "New key", "sm")
+        acts = coin_form(csrf, name)
+        acts += ufm(csrf, "reset", name, "New key", "sm")
         acts += ufm(csrf, "toggle", name, "Unban" if banned else "Ban", "sm" if banned else "sm dng")
         acts += ufm(csrf, "role", name, "Make user" if is_admin else "Make admin", "sm")
         acts += ufm(csrf, "delete", name, "Delete", "sm dng",
                     "<label class=mini><input type=checkbox name=confirm value=yes required> confirm</label>")
-    return "<div class=ucard>" + head + flags + quotas + "<div class=acts style='margin-top:8px'>" + acts + "</div></div>"
+    return ("<div class=ucard>" + head + flags + money + quotas +
+            "<div class=acts style='margin-top:8px'>" + acts + "</div></div>")
 
 
 # =====================================================
@@ -1192,6 +1452,15 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_json(self, code, obj):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self._sec_headers()
+        self.end_headers()
+        self.wfile.write(data)
+
     def go(self, to, extra=None):
         self.send_response(303)
         self.send_header("Location", to)
@@ -1220,7 +1489,7 @@ class H(BaseHTTPRequestHandler):
                 SESSIONS.pop(m.value, None)
                 return None
         rec = users_load().get(s["user"])
-        if not rec or rec.get("disabled") or not has_key(rec):
+        if not rec or rec.get("disabled") or not has_key(rec) or is_expired(rec):
             with LOCK:
                 SESSIONS.pop(m.value, None)
             return None
@@ -1233,6 +1502,25 @@ class H(BaseHTTPRequestHandler):
             self.send_html(500, page("Error", "<h1>Something went wrong</h1><p class=mut>Check the panel log.</p>"))
         except Exception:
             pass
+
+    # ----- internal API (bot ⇄ panel) -----
+    def internal_api(self, path, raw):
+        # Requests that came through Cloudflare Tunnel carry these headers -> refuse
+        if self.headers.get("CF-Ray") or self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For"):
+            return self.send_json(403, {"ok": False, "error": "forbidden"})
+        if self.client_address[0] != "127.0.0.1":
+            return self.send_json(403, {"ok": False, "error": "forbidden"})
+        want = bot_cfg().get("internal_secret") or ""
+        got = self.headers.get("X-Bot-Secret", "") or ""
+        if not want or not hmac.compare_digest(got.encode(), want.encode()):
+            return self.send_json(403, {"ok": False, "error": "bad secret"})
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(body, dict):
+                raise ValueError("not an object")
+        except Exception:
+            return self.send_json(400, {"ok": False, "error": "bad json"})
+        self.send_json(200, internal_dispatch(path, body))
 
     # ----- GET -----
     def do_GET(self):
@@ -1280,6 +1568,11 @@ class H(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             n = 0
+        if path.startswith("/internal/"):
+            if n > 65536:
+                return self.send_json(413, {"ok": False, "error": "too large"})
+            raw = self.rfile.read(n) if n > 0 else b""
+            return self.internal_api(path, raw)
         limit = MAX_UPLOAD + 65536 if path == "/upload" else 65536
         if n > limit:
             return self.send_html(413, page("Too large", "<p class=center>Request too large (max 2 MB).</p>"))
@@ -1309,11 +1602,17 @@ class H(BaseHTTPRequestHandler):
     # ----- auth -----
     def login_page(self, err=""):
         e = "<div class='flash bad'>%s</div>" % esc(err) if err else ""
+        bu = bot_cfg().get("username")
+        bot = ""
+        if bu:
+            bot = ("<p class='center mut' style='font-size:13px;margin:10px 0 0'>Get or renew your key in Telegram: "
+                   "<a href='https://t.me/%s' target=_blank rel=noopener style='color:#7dd3fc'>@%s</a></p>"
+                   % (esc(bu), esc(bu)))
         body = ("<div class=auth><div class=authbox>"
                 "<div class=center><span class=badge style='display:inline-grid;width:56px;height:56px;border-radius:18px'>"
                 + BOLT_SVG.replace("<svg", "<svg style='width:28px;height:28px;fill:#0b0b1a'") +
                 "</span><h1 style='margin-top:14px'>" + esc(PANEL_NAME) + "</h1>"
-                "<p class='center mut' style='margin-top:0'>Userbot control panel · enter your access key</p></div>" + e +
+                "<p class='center mut' style='margin-top:0'>Userbot control panel · enter your access key</p>" + bot + "</div>" + e +
                 "<div class=card><form method=post action=/login>"
                 "<label>Access key</label>"
                 "<input type=password name=key autocomplete=off autocapitalize=off spellcheck=false required placeholder='tbp_...'>"
@@ -1331,8 +1630,7 @@ class H(BaseHTTPRequestHandler):
             until = FAILS.get(ip, [0, 0])[1]
         if until > now:
             return self.send_html(429, page("Locked", "<p class=center>Too many attempts. Wait a few minutes.</p>"))
-        users = users_load()
-        name, rec = find_by_key(users, f.get("key", ""))
+        name, rec = find_by_key(users_load(), f.get("key", ""))
         if not name or rec.get("disabled"):
             with LOCK:
                 c, until = FAILS.get(ip, [0, 0])
@@ -1343,6 +1641,8 @@ class H(BaseHTTPRequestHandler):
             sys.stderr.write("LOGIN FAILED from %s\n" % ip)
             time.sleep(1)
             return self.login_page("Invalid or disabled access key")
+        if is_expired(rec):
+            return self.login_page("Your key has expired. Renew it in the Telegram bot.")
         tok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         with LOCK:
             FAILS.pop(ip, None)
@@ -1358,14 +1658,16 @@ class H(BaseHTTPRequestHandler):
     # ----- pages -----
     def dash(self, s):
         admin = s["role"] == "admin"
-        top = ""
+        rec = users_load().get(s["user"], {})
         if admin:
             st = stats()
             mp = pct(st["mem_used"], st["mem_total"])
             dp = pct(st["disk_used"], st["disk_total"])
             cores = st["cores"]
             tun = "<span class='pill %s'>Tunnel %s</span>" % ("ok" if tunnel_up() else "bad", "up" if tunnel_up() else "down")
-            top = ("<div class=kv style='margin-top:8px'>" + tun + "</div>"
+            bu = bot_cfg().get("username")
+            bp = "<span class='pill %s'>Telegram bot %s</span>" % (("ok", "@" + esc(bu)) if (bu and bot_up()) else ("bad", "off"))
+            top = ("<div class=kv style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap'>" + tun + bp + "</div>"
                    "<div class=grid style='margin-top:14px'>"
                    + tile("CPU load", "%.2f" % st["load1"], min(100, int(st["load1"] * 100 / cores)),
                           "%d cores · %s" % (cores, " ".join(st["load"])))
@@ -1376,10 +1678,10 @@ class H(BaseHTTPRequestHandler):
             heading = "All bots"
             sub = "Server health &amp; every userbot on this VPS"
         else:
-            top = quota_tiles(s["user"])
+            top = "<div class=grid style='margin-top:8px'>" + sub_tiles(rec) + quota_tiles(s["user"]) + "</div>"
             bots = list_bots(owner=s["user"])
             heading = "Your bots"
-            sub = "Your resources and userbots"
+            sub = "Your time, coins, resources and userbots"
         rows = "".join(bot_row(m, admin) for m in bots) or "<div class=empty>No bots yet. Upload one below ↓</div>"
         body = ("<div class=hero><h1>Welcome, " + esc(s["user"]) + "</h1><div class=mut>" + sub + "</div></div>"
                 "<div class=sec>Overview</div>" + top +
@@ -1424,7 +1726,7 @@ class H(BaseHTTPRequestHandler):
                 "<div class=mut>" + esc(m.get("kind", "").upper()) + " bot · owner <b>" + esc(m.get("owner", "")) +
                 "</b> · id " + bid + "</div>"
                 "<div class=sec>Status</div><div class=card>"
-                "<div class=row style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px'>"
+                "<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px'>"
                 "<div>" + spin + "<span class='pill " + cls + "'>" + esc(label) + "</span></div>"
                 "<div class=kv>PID <b>" + esc(m.get("pid") or "-") + "</b></div></div>"
                 "<div class=kv style='margin-top:8px'>" + esc(m.get("msg", "")) + "</div>"
@@ -1448,18 +1750,25 @@ class H(BaseHTTPRequestHandler):
         self.send_html(200, layout(s, "TURBO CHANNEL · Logs", body, "dash", refresh))
 
     def account_page(self, s):
-        body = ("<div class=hero><h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · "
-                + esc(s["role"]) + "</div></div>" + reveal_box(s) +
-                "<div class=sec>My resources</div>" + quota_tiles(s["user"]) if s["role"] != "admin" else
-                "<div class=hero><h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · admin</div></div>"
-                + reveal_box(s))
-        body += ("<div class=sec>My access key</div><div class=card>"
-                 "<p class=mut style='margin-top:0'>Lost your key? Generate a new one. Your old key and your other "
-                 "sessions stop working immediately.</p>"
-                 "<form method=post action=/account/key>"
-                 "<input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
-                 "<label class=chk><input type=checkbox name=confirm value=yes required> I understand my current key will stop working</label>"
-                 "<button class='btn pri wide'>Generate new key</button></form></div>")
+        rec = users_load().get(s["user"], {})
+        wait = key_wait_left(rec)
+        head = ("<div class=hero><h1>Account</h1><div class=mut>Signed in as <b>" + esc(s["user"]) + "</b> · "
+                + esc(s["role"]) + "</div></div>" + reveal_box(s))
+        if s["role"] != "admin":
+            head += ("<div class=sec>My time &amp; resources</div><div class=grid>"
+                     + sub_tiles(rec) + quota_tiles(s["user"]) + "</div>")
+        if wait > 0:
+            key_box = ("<p class=mut style='margin-top:0'>Key ထုတ်ခွင့် တစ်နေ့ တစ်ကြိမ်သာ ရှိပါတယ်။ "
+                       "<b>%s</b> အကြာမှ ထုတ်လို့ရပါမယ်။</p>"
+                       "<button class='btn wide' disabled>Generate new key (locked)</button>" % esc(fmt_wait(wait)))
+        else:
+            key_box = ("<p class=mut style='margin-top:0'>Lost your key? Generate a new one. Your old key and your other "
+                       "sessions stop working immediately. <b>Once per 24 hours.</b></p>"
+                       "<form method=post action=/account/key>"
+                       "<input type=hidden name=csrf value='" + esc(s["csrf"]) + "'>"
+                       "<label class=chk><input type=checkbox name=confirm value=yes required> I understand my current key will stop working</label>"
+                       "<button class='btn pri wide'>Generate new key</button></form>")
+        body = head + "<div class=sec>My access key</div><div class=card>" + key_box + "</div>"
         self.send_html(200, layout(s, "TURBO CHANNEL · Account", body, "acct"))
 
     def users_page(self, s):
@@ -1480,7 +1789,8 @@ class H(BaseHTTPRequestHandler):
                   "<label>Role</label><select name=role><option value=user>User</option><option value=admin>Admin</option></select>"
                   "<button class='btn pri wide'>Create account &amp; generate key</button></form></div>")
         body = ("<div class=hero><h1>Users</h1><div class=mut>Quota per user: RAM "
-                + str(QUOTA_RAM_MB) + " MB · CPU " + str(QUOTA_CPU) + " core · Disk " + str(QUOTA_DISK_MB) + " MB</div></div>"
+                + str(QUOTA_RAM_MB) + " MB · CPU " + str(QUOTA_CPU) + " core · Disk " + str(QUOTA_DISK_MB) + " MB · "
+                + str(COIN_PER_DAY) + " coin = 1 day</div></div>"
                 + reveal_box(s) + "<div class=sec>Accounts</div><div class=ugrid>" + cards + "</div>"
                 "<div class=sec>New account</div>" + create)
         self.send_html(200, layout(s, "TURBO CHANNEL · Users", body, "users"))
@@ -1589,13 +1899,15 @@ class H(BaseHTTPRequestHandler):
                 return self.flash_go(s, "bad", "Invalid username (3-32 chars: a-z, 0-9, _ . -)", back)
             if role not in ("user", "admin"):
                 role = "user"
-            with LOCK:
-                users = users_load()
+
+            def create(users):
                 if name in users:
-                    return self.flash_go(s, "bad", "Username already exists", back)
+                    return None
                 users[name] = new_record(role)
-                key = issue_key(users[name])
-                users_save(users)
+                return issue_key(users[name])
+            key = users_mutate(create)
+            if key is None:
+                return self.flash_go(s, "bad", "Username already exists", back)
             if role != "admin":
                 cg_setup(name)
             with LOCK:
@@ -1605,6 +1917,17 @@ class H(BaseHTTPRequestHandler):
         users = users_load()
         if name not in users:
             return self.flash_go(s, "bad", "User not found", back)
+
+        if act == "coins":
+            try:
+                amount = int(f.get("amount", "0"))
+            except ValueError:
+                return self.flash_go(s, "bad", "Amount must be a whole number", back)
+            if amount == 0 or abs(amount) > 100000:
+                return self.flash_go(s, "bad", "Amount must be between -100000 and 100000 (not 0)", back)
+            new = add_coins(name, amount)
+            return self.flash_go(s, "ok", "%s now has %d coins" % (name, new), back)
+
         if name == s["user"]:
             return self.flash_go(s, "bad", "Use the Account page for your own key", back)
         rec = users[name]
@@ -1612,10 +1935,7 @@ class H(BaseHTTPRequestHandler):
         is_last_admin = rec.get("role") == "admin" and name in admins_on and len(admins_on) == 1
 
         if act == "reset":
-            with LOCK:
-                users = users_load()
-                key = issue_key(users[name])
-                users_save(users)
+            key = users_mutate(lambda u: issue_key(u[name]))
             kill_sessions(name)
             with LOCK:
                 s["reveal"] = (name, key)
@@ -1624,13 +1944,14 @@ class H(BaseHTTPRequestHandler):
         if act == "toggle":
             if not rec.get("disabled") and is_last_admin:
                 return self.flash_go(s, "bad", "Cannot ban the last active admin", back)
-            with LOCK:
-                users = users_load()
-                users[name]["disabled"] = not rec.get("disabled")
-                if not users[name]["disabled"]:
-                    users[name]["strikes"] = 0
-                users_save(users)
-            if not rec.get("disabled"):
+
+            def toggle(u):
+                u[name]["disabled"] = not u[name].get("disabled")
+                if not u[name]["disabled"]:
+                    u[name]["strikes"] = 0
+                return u[name]["disabled"]
+            banned = users_mutate(toggle)
+            if banned:
                 for m in list_bots(owner=name):
                     stop_bot(m["id"])
                 kill_sessions(name)
@@ -1641,10 +1962,10 @@ class H(BaseHTTPRequestHandler):
             new_role = "user" if rec.get("role") == "admin" else "admin"
             if new_role == "user" and is_last_admin:
                 return self.flash_go(s, "bad", "Cannot demote the last active admin", back)
-            with LOCK:
-                users = users_load()
-                users[name]["role"] = new_role
-                users_save(users)
+
+            def setrole(u):
+                u[name]["role"] = new_role
+            users_mutate(setrole)
             return self.flash_go(s, "ok", name + " is now " + new_role, back)
 
         if act == "delete":
@@ -1656,10 +1977,10 @@ class H(BaseHTTPRequestHandler):
                 stop_bot(m["id"])
                 shutil.rmtree(bdir(m["id"]), ignore_errors=True)
                 drop_bot_user(m["id"])
-            with LOCK:
-                users = users_load()
-                users.pop(name, None)
-                users_save(users)
+
+            def drop(u):
+                u.pop(name, None)
+            users_mutate(drop)
             kill_sessions(name)
             d = cg_dir(name)
             if os.path.isdir(d):
@@ -1674,13 +1995,23 @@ class H(BaseHTTPRequestHandler):
     def do_own_key(self, s, f):
         if f.get("confirm") != "yes":
             return self.flash_go(s, "bad", "Tick the confirmation box first", "/account")
-        with LOCK:
-            users = users_load()
+        result = {"ok": False, "msg": ""}
+
+        def fn(users):
             rec = users.get(s["user"])
             if not rec or rec.get("disabled"):
-                return self.flash_go(s, "bad", "Account unavailable", "/account")
-            key = issue_key(rec)
-            users_save(users)
+                result["msg"] = "Account unavailable"
+                return None
+            wait = key_wait_left(rec)
+            if wait > 0:
+                result["msg"] = "Key can be issued once per day. Try again in %s." % fmt_wait(wait)
+                return None
+            result["ok"] = True
+            return issue_key(rec)
+
+        key = users_mutate(fn)
+        if not result["ok"]:
+            return self.flash_go(s, "bad", result["msg"], "/account")
         kill_sessions(s["user"], keep=s["tok"])
         with LOCK:
             s["reveal"] = (s["user"], key)
@@ -1688,13 +2019,101 @@ class H(BaseHTTPRequestHandler):
 
 
 # =====================================================
+#  CLI
+# =====================================================
+def cli_new_key(name):
+    name = name.strip().lower()
+    if not valid_name(name):
+        sys.exit("Invalid username (3-32 chars: a-z, 0-9, _ . -)")
+
+    def fn(users):
+        if name not in users:
+            users[name] = new_record("admin")
+        rec = users[name]
+        rec["disabled"] = False
+        return rec.get("role"), issue_key(rec)
+    role, key = users_mutate(fn)
+    print("")
+    print("Access key for '%s' (role: %s) - shown ONCE, save it now:" % (name, role))
+    print(key)
+    print("")
+
+
+def read_input(prompt, secret=False):
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt) if secret else input(prompt)
+    return sys.stdin.read().strip()
+
+
+def cli_bot_token():
+    t = read_input("Bot token (from @BotFather): ", secret=True)
+    if not TOKEN_RE.fullmatch(t or ""):
+        sys.exit("That does not look like a bot token")
+    bot_cfg_update(token=t)
+    print("Bot token saved (config.json, root only).")
+
+
+def cli_bot_admin(x):
+    if not x.isdigit():
+        sys.exit("Telegram ID must be a number")
+    ids = set(int(i) for i in bot_cfg().get("admins", []) if str(i).isdigit())
+    ids.add(int(x))
+    bot_cfg_update(admins=sorted(ids))
+    print("Admins: %s" % ", ".join(str(i) for i in sorted(ids)))
+
+
+def cli_bot_set(key, val):
+    if key == "channel" and not CHANNEL_RE.fullmatch(val):
+        sys.exit("Channel must look like @username")
+    if key == "panel_url" and not val.startswith("https://"):
+        sys.exit("Panel URL must start with https://")
+    bot_cfg_update(**{key: val})
+    print("%s saved" % key)
+
+
+def cli_ref_reward(v):
+    if not v.isdigit() or int(v) > 100:
+        sys.exit("Reward must be a number between 0 and 100")
+    bot_cfg_update(ref_reward=int(v))
+    print("Referral reward: %s coin per invite" % v)
+
+
+def cli_bot_status():
+    b = dict(bot_cfg())
+    b["token"] = "set" if b.get("token") else "not set"
+    b["internal_secret"] = "set" if b.get("internal_secret") else "not set"
+    print(json.dumps(b, indent=2, ensure_ascii=False))
+
+
+# =====================================================
 #  Entry point
 # =====================================================
 def main():
+    if sys.version_info < (3, 10):
+        sys.exit("TURBO CHANNEL needs Python 3.10 or newer")
     a = sys.argv
-    if len(a) == 3 and a[1] in ("--set-password", "--new-key"):
+    cmd = a[1] if len(a) > 1 else ""
+    if cmd in ("--set-password", "--new-key") and len(a) == 3:
         os.makedirs(HOME, mode=0o700, exist_ok=True)
         return cli_new_key(a[2])
+    if cmd == "--bot-token":
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        return cli_bot_token()
+    if cmd == "--bot-admin" and len(a) == 3:
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        return cli_bot_admin(a[2])
+    if cmd == "--bot-channel" and len(a) == 3:
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        return cli_bot_set("channel", a[2])
+    if cmd == "--panel-url" and len(a) == 3:
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        return cli_bot_set("panel_url", a[2])
+    if cmd == "--ref-reward" and len(a) == 3:
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        return cli_ref_reward(a[2])
+    if cmd == "--bot-status":
+        return cli_bot_status()
+
     os.makedirs(BOTS, mode=0o711, exist_ok=True)
     if IS_ROOT:
         os.chmod(HOME, 0o711)
@@ -1723,6 +2142,10 @@ def main():
             print("NOTE: cgroup v2 not available - RAM/CPU quota runs in SOFT mode", flush=True)
     else:
         print("NOTE: not running as root - bots run as this user; quotas are SOFT", flush=True)
+
+    ensure_internal_secret()
+    print("Telegram bot runs as separate service: tb-bot", flush=True)
+
     threading.Thread(target=watchdog, daemon=True).start()
     print("TURBO CHANNEL V %s · Userbot Web Panel · http://127.0.0.1:%d" % (VERSION, PORT), flush=True)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
